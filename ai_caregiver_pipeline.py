@@ -14,6 +14,7 @@ from caregiver_engine import (
     run_phase1_matching,
     run_phase2_optimization,
     run_phase3_did,
+    validate_ba_codes,
 )
 
 EXCEL_PATH = DEFAULT_EXCEL_PATH
@@ -27,6 +28,15 @@ def main():
     print("=" * 60)
 
     df_cg, df_cl, df_tasks, df_hist, tasks = load_data(EXCEL_PATH)
+
+    # ------------------------------------------
+    # Phase 0：BA 服務代碼併報法規防呆健檢（僅提示，不影響下方派單運算）
+    # ------------------------------------------
+    validated_tasks = validate_ba_codes(tasks)
+    violation_count = int(validated_tasks["含違規代碼"].sum())
+    print(f"\n[Phase 0] BA 服務代碼併報健檢：{len(validated_tasks)} 筆任務中，{violation_count} 筆疑似違規。")
+    if violation_count > 0:
+        print(validated_tasks.loc[validated_tasks["含違規代碼"], ["任務ID", "BA代碼檢核異常"]].to_string(index=False))
 
     # ------------------------------------------
     # Phase 1
@@ -47,6 +57,9 @@ def main():
         df_result = phase2["df_result"]
         print(f"\n【派單結果總覽】 成功指派: {phase2['assigned_count']} / {len(df_tasks)} 筆任務")
         print(df_result.drop(columns=["地點緯度", "地點經度"]).to_string(index=False))
+        total_revenue = df_result["預估長照申報點數(營收)"].sum()
+        total_salary = df_result["預估居服員拆帳薪資"].sum()
+        print(f"\n【財務試算】 預估長照申報總點數(營收): {total_revenue:,.0f} 點 | 預估居服員拆帳總薪資: {total_salary:,.0f} 元")
     else:
         print("無法找到最佳解，請檢查限制條件。")
 
