@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from caregiver_engine import (
     PipelineConfig,
+    run_monthly_batch_dispatch,
     run_phase1_matching,
     run_phase2_optimization,
 )
@@ -237,8 +238,9 @@ class ContinuityPriorityTests(unittest.TestCase):
 
 
 class CaregiverChangeReasonTests(unittest.TestCase):
-    """指派明細表「更新居服員原因」欄：新客戶或維持原居服員時應為空值，
-    確實更換居服員時必須附上可解釋的具體原因。
+    """指派明細表「原首選替換原因」欄：新客戶或維持原首選居服員時應為空值，
+    確實更換居服員時必須附上可解釋的具體原因，且須明確標註原首選居服員 ID
+    以避免與本次獲派居服員混淆。
     """
 
     def test_new_client_without_preferred_caregiver_is_blank(self):
@@ -250,7 +252,7 @@ class CaregiverChangeReasonTests(unittest.TestCase):
         phase2 = run_phase2_optimization(df_matches, tasks, df_cg, config)
         df_result = phase2["df_result"]
 
-        self.assertEqual(df_result.iloc[0]["更新居服員原因"], "")
+        self.assertEqual(df_result.iloc[0]["原首選替換原因"], "")
 
     def test_unchanged_preferred_caregiver_is_blank(self):
         config = PipelineConfig()
@@ -262,7 +264,7 @@ class CaregiverChangeReasonTests(unittest.TestCase):
         df_result = phase2["df_result"]
 
         self.assertEqual(df_result.iloc[0]["派單居服員"], "CG01")
-        self.assertEqual(df_result.iloc[0]["更新居服員原因"], "")
+        self.assertEqual(df_result.iloc[0]["原首選替換原因"], "")
 
     def test_hard_constraint_failure_gives_specific_reason(self):
         config = PipelineConfig()
@@ -286,7 +288,9 @@ class CaregiverChangeReasonTests(unittest.TestCase):
         df_result = phase2["df_result"]
 
         self.assertEqual(df_result.iloc[0]["派單居服員"], "CG_female_alt")
-        self.assertIn("性別不符", df_result.iloc[0]["更新居服員原因"])
+        change_reason = df_result.iloc[0]["原首選替換原因"]
+        self.assertIn("原首選居服員[CG_male_pref]", change_reason)
+        self.assertIn("性別不符", change_reason)
 
     def test_existing_schedule_conflict_gives_specific_reason(self):
         config = PipelineConfig()
@@ -305,7 +309,10 @@ class CaregiverChangeReasonTests(unittest.TestCase):
         df_result = phase2["df_result"]
 
         self.assertEqual(df_result.iloc[0]["派單居服員"], "CG_free_alt")
-        self.assertEqual(df_result.iloc[0]["更新居服員原因"], "原居服員今日既定行程與本任務時段衝突")
+        self.assertEqual(
+            df_result.iloc[0]["原首選替換原因"],
+            "原首選居服員[CG_busy_pref]今日既定行程與本任務時段衝突",
+        )
 
     def test_double_booked_with_other_new_task_gives_specific_reason(self):
         config = PipelineConfig()
@@ -336,9 +343,206 @@ class CaregiverChangeReasonTests(unittest.TestCase):
         df_result = phase2["df_result"].set_index("任務ID")
 
         self.assertEqual(df_result.loc["TK_A", "派單居服員"], "CG_pref")
-        self.assertEqual(df_result.loc["TK_A", "更新居服員原因"], "")
+        self.assertEqual(df_result.loc["TK_A", "原首選替換原因"], "")
         self.assertEqual(df_result.loc["TK_B", "派單居服員"], "CG_alt")
-        self.assertEqual(df_result.loc["TK_B", "更新居服員原因"], "原居服員該時段已媒合其他案家任務")
+        self.assertEqual(
+            df_result.loc["TK_B", "原首選替換原因"],
+            "原首選居服員[CG_pref]該時段已媒合其他案家任務",
+        )
+
+
+class WeekdayHardConstraintTests(unittest.TestCase):
+    """新版月批次排班資料表的「星期」／「可排班星期」防呆：欄位確實存在於資料表中時，
+    若個別儲存格缺漏或格式無法解析，必須 fail-closed（保守判定當日不可派單），
+    不可如舊版邏輯般被 `pd.notna()` 靜默跳過而 fail-open（誤判為全天候可排班）。
+    """
+
+    def test_missing_allowed_days_cell_is_rejected_not_silently_allowed(self):
+        config = PipelineConfig()
+        cg_with_days = make_caregiver("CG_scheduled")
+        cg_with_days["可排班星期"] = "1,2,3,4,5"
+        cg_missing_days = make_caregiver("CG_missing_days")
+        cg_missing_days["可排班星期"] = None
+        df_cg = pd.DataFrame([cg_with_days, cg_missing_days])
+
+        task = make_task("TK01", "CL01", "08:00", "10:00", 120)
+        task["星期"] = "星期一"
+        tasks = pd.DataFrame([task])
+
+        df_matches = run_phase1_matching(tasks, df_cg, config)
+
+        matched_cg_ids = set(df_matches["居服員ID"])
+        self.assertIn("CG_scheduled", matched_cg_ids)
+        self.assertNotIn("CG_missing_days", matched_cg_ids)
+
+    def test_unrecognized_task_weekday_is_rejected_not_silently_allowed(self):
+        config = PipelineConfig()
+        cg = make_caregiver("CG01")
+        cg["可排班星期"] = "1,2,3,4,5"
+        df_cg = pd.DataFrame([cg])
+
+        task = make_task("TK01", "CL01", "08:00", "10:00", 120)
+        task["星期"] = "週一"  # 非標準「星期一」格式，WEEKDAY_NAME_TO_NUM 無法辨識
+        tasks = pd.DataFrame([task])
+
+        df_matches = run_phase1_matching(tasks, df_cg, config)
+
+        self.assertTrue(df_matches.empty)
+
+    def test_legacy_table_without_weekday_columns_is_unaffected(self):
+        """舊版資料表整體不含「星期」／「可排班星期」欄位時，此檢查應完全跳過，
+        向下相容行為不變。"""
+        config = PipelineConfig()
+        df_cg = pd.DataFrame([make_caregiver("CG01")])
+        tasks = pd.DataFrame([make_task("TK01", "CL01", "08:00", "10:00", 120)])
+
+        df_matches = run_phase1_matching(tasks, df_cg, config)
+
+        self.assertIn("CG01", set(df_matches["居服員ID"]))
+
+
+class MandatoryBreakConstraintTests(unittest.TestCase):
+    """規則1：居服員累計連續工作達 continuous_work_limit_mins(預設240分鐘)，
+    下一段任務與前段之間須強制間隔 mandatory_break_mins(預設30分鐘)。
+    """
+
+    def test_chain_of_new_tasks_cannot_all_be_assigned_without_break(self):
+        """四筆 90 分鐘任務、彼此間隔 20 分鐘(< 30 分鐘門檻)串成同一條連續鏈，
+        累計於第 3 筆即達 240 分鐘門檻，第 4 筆不得與前 3 筆同時獲派。"""
+        config = PipelineConfig()
+        df_cg = pd.DataFrame([make_caregiver("CG01", daily_cap=12.0)])
+        tasks = pd.DataFrame(
+            [
+                make_task("TK01", "CL01", "08:00", "09:30", 90),
+                make_task("TK02", "CL02", "09:50", "11:20", 90),
+                make_task("TK03", "CL03", "11:40", "13:10", 90),
+                make_task("TK04", "CL04", "13:30", "15:00", 90),
+            ]
+        )
+
+        df_matches = run_phase1_matching(tasks, df_cg, config)
+        phase2 = run_phase2_optimization(df_matches, tasks, df_cg, config)
+
+        self.assertLessEqual(phase2["assigned_count"], 3)
+
+    def test_break_of_at_least_30min_resets_the_chain(self):
+        """同樣四筆任務，只要在鏈中插入一段 >=30 分鐘的空檔，鏈即被截斷為兩段
+        各自累計皆未達門檻，四筆任務應可全數獲派。"""
+        config = PipelineConfig()
+        df_cg = pd.DataFrame([make_caregiver("CG01", daily_cap=12.0)])
+        tasks = pd.DataFrame(
+            [
+                make_task("TK01", "CL01", "08:00", "09:30", 90),
+                make_task("TK02", "CL02", "09:50", "11:20", 90),
+                make_task("TK03", "CL03", "11:55", "13:25", 90),  # 与 TK02 間隔 35 分鐘 (>=30)
+                make_task("TK04", "CL04", "13:45", "15:15", 90),
+            ]
+        )
+
+        df_matches = run_phase1_matching(tasks, df_cg, config)
+        phase2 = run_phase2_optimization(df_matches, tasks, df_cg, config)
+
+        self.assertEqual(phase2["assigned_count"], 4)
+
+    def test_existing_appointments_alone_can_force_block_new_task(self):
+        """既有既定行程本身（不可變動）累計已達 240 分鐘門檻時，緊接其後、間隔
+        僅 20 分鐘的新候選任務必須被禁止指派，即使該任務本身完全符合其他條件。"""
+        config = PipelineConfig()
+        cg = make_caregiver("CG01", daily_cap=12.0, busy1="06:00-09:00", busy2="09:20-10:20")
+        df_cg = pd.DataFrame([cg])
+        tasks = pd.DataFrame([make_task("TK01", "CL01", "10:40", "11:40", 60)])
+
+        df_matches = run_phase1_matching(tasks, df_cg, config)
+        phase2 = run_phase2_optimization(df_matches, tasks, df_cg, config)
+
+        self.assertEqual(phase2["assigned_count"], 0)
+
+
+class PeriodicPriorityTests(unittest.TestCase):
+    """規則2：週期性排班優先於臨時單次排班——月批次派單時，先鎖定週期性任務班表，
+    臨時單次任務只能競爭剩餘的居服員產能與時段。
+    """
+
+    def _periodic_task(self, t_id, c_id, start, end, duration_min, date_str, is_periodic):
+        task = make_task(t_id, c_id, start, end, duration_min)
+        task["日期"] = date_str
+        task["是否為週期性任務"] = is_periodic
+        return task
+
+    def test_periodic_task_wins_time_conflict_over_adhoc_task(self):
+        config = PipelineConfig()
+        df_cg = pd.DataFrame([make_caregiver("CG01", daily_cap=10.0)])
+        tasks = pd.DataFrame(
+            [
+                self._periodic_task("TK_PERIODIC", "CL01", "08:00", "09:30", 90, "2026-08-03", True),
+                self._periodic_task("TK_ADHOC", "CL02", "08:15", "09:45", 90, "2026-08-03", False),
+            ]
+        )
+
+        batch = run_monthly_batch_dispatch(tasks, df_cg, config, date_column="日期")
+        df_result_all = batch["df_result_all"]
+        assigned_ids = set(df_result_all["任務ID"]) if not df_result_all.empty else set()
+
+        self.assertIn("TK_PERIODIC", assigned_ids)
+        self.assertNotIn("TK_ADHOC", assigned_ids)
+
+    def test_adhoc_task_only_gets_leftover_capacity_after_periodic(self):
+        config = PipelineConfig()
+        df_cg = pd.DataFrame([make_caregiver("CG01", daily_cap=4.0)])  # 240 分鐘上限
+        tasks = pd.DataFrame(
+            [
+                self._periodic_task("TK_P1", "CL01", "08:00", "09:10", 70, "2026-08-03", True),
+                self._periodic_task("TK_P2", "CL02", "09:40", "10:50", 70, "2026-08-03", True),
+                self._periodic_task("TK_P3", "CL03", "11:20", "12:30", 70, "2026-08-03", True),
+                # 週期性任務共佔用 210 分鐘，僅剩 30 分鐘產能，臨時任務需 60 分鐘應被拒。
+                self._periodic_task("TK_ADHOC", "CL04", "13:00", "14:00", 60, "2026-08-03", False),
+            ]
+        )
+
+        batch = run_monthly_batch_dispatch(tasks, df_cg, config, date_column="日期")
+        df_result_all = batch["df_result_all"]
+        assigned_ids = set(df_result_all["任務ID"]) if not df_result_all.empty else set()
+
+        self.assertTrue({"TK_P1", "TK_P2", "TK_P3"}.issubset(assigned_ids))
+        self.assertNotIn("TK_ADHOC", assigned_ids)
+
+    def test_legacy_table_without_periodic_column_is_unaffected(self):
+        """舊版資料表不含「是否為週期性任務」欄位時，維持原本單一批次邏輯。"""
+        config = PipelineConfig()
+        df_cg = pd.DataFrame([make_caregiver("CG01", daily_cap=10.0)])
+        task = make_task("TK01", "CL01", "08:00", "09:30", 90)
+        task["日期"] = "2026-08-03"
+        tasks = pd.DataFrame([task])
+
+        batch = run_monthly_batch_dispatch(tasks, df_cg, config, date_column="日期")
+        self.assertEqual(batch["total_assigned_count"], 1)
+
+
+class MonthlyFatigueRollingTests(unittest.TestCase):
+    """規則5：月排班動態時數滾動——每完成一天的排班，須將當天指派時數累加回
+    居服員的累計疲勞度時數，隔天排班時納入權重計算(偏好累計時數較少者)。
+    """
+
+    def test_second_day_prefers_caregiver_with_less_accumulated_hours(self):
+        config = PipelineConfig()
+        df_cg = pd.DataFrame(
+            [
+                make_caregiver("CG_A", fatigue=0.0, daily_cap=10.0),
+                make_caregiver("CG_B", fatigue=0.0, daily_cap=10.0),
+            ]
+        )
+
+        day1_task = make_task("TK_DAY1", "CL01", "08:00", "12:00", 240, pref_cg="CG_A")
+        day1_task["日期"] = "2026-08-03"
+        day2_task = make_task("TK_DAY2", "CL02", "08:00", "10:00", 120, pref_cg="")
+        day2_task["日期"] = "2026-08-04"
+        tasks = pd.DataFrame([day1_task, day2_task])
+
+        batch = run_monthly_batch_dispatch(tasks, df_cg, config, date_column="日期")
+        df_result_all = batch["df_result_all"].set_index("任務ID")
+
+        self.assertEqual(df_result_all.loc["TK_DAY1", "派單居服員"], "CG_A")
+        self.assertEqual(df_result_all.loc["TK_DAY2", "派單居服員"], "CG_B")
 
 
 if __name__ == "__main__":

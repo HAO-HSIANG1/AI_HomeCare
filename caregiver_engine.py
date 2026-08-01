@@ -3,11 +3,17 @@
 將原始三階段流程（適配度評分 -> OR-Tools 最佳化 -> DiD 效益回溯）拆成可
 重複呼叫的函式，並把所有具派單政策意義的係數集中到 PipelineConfig，供
 CLI (ai_caregiver_pipeline.py) 與網頁儀表板 (app.py) 共用同一份邏輯。
+
+另包含 BA 服務代碼併報法規防呆檢核、長照申報點數與居服員拆帳薪資試算、
+星期／可服務時段／請假防呆的硬性條件，以及依日期逐日批次派單的輔助函式。
+新增的欄位需求皆以 `.get()`／`pd.notna()` 方式取值，僅在資料表實際具備對應
+欄位時才生效，因此仍可原封不動套用在既有的單日排班資料表格式上。
 """
 
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -43,6 +49,45 @@ SPECIAL_CERT_REQUIREMENTS = {
     "失智引導與精神陪伴": {"失智症照顧專長", "精神疾病照顧專長"},
 }
 
+# 星期中文名稱 -> ISO 星期數字（1=一 ... 7=日），供「可排班星期」防呆使用。
+WEEKDAY_NAME_TO_NUM = {
+    "星期一": 1, "星期二": 2, "星期三": 3, "星期四": 4,
+    "星期五": 5, "星期六": 6, "星期日": 7,
+}
+WEEKDAY_NUM_TO_NAME = {v: k for k, v in WEEKDAY_NAME_TO_NUM.items()}
+
+
+def get_weekday_name(date_value) -> str:
+    """將日期值轉換為中文星期名稱（"星期一"...），供派單結果表格顯示用。
+
+    無法解析（空值、格式不符）時回傳空字串，而非拋出例外，避免單一列的日期
+    格式問題導致整張結果表格無法呈現。
+    """
+    if pd.isna(date_value) or str(date_value).strip() == "":
+        return ""
+    try:
+        parsed = pd.to_datetime(date_value)
+    except (ValueError, TypeError):
+        return ""
+    return WEEKDAY_NUM_TO_NAME.get(parsed.isoweekday(), "")
+
+# 台灣長照 2.0 常用 BA 服務代碼點數（點值，機構申報營收以此試算；1 點通常對應約 1 元）。
+BA_UNIT_POINTS = {
+    "BA01": 175,
+    "BA02": 210,
+    "BA03": 150,
+    "BA04": 180,
+    "BA05": 200,
+    "BA07": 250,
+    "BA08": 300,
+    "BA09": 160,
+    "BA10": 190,
+}
+
+# 無法由 Service_Code_1/2 判斷點數時（例如資料表未升級至含 BA 碼申報欄位），
+# 退回以服務歷時概算點數：每 30 分鐘 = 150 點。
+_FALLBACK_POINTS_PER_30MIN = 150.0
+
 
 @dataclass
 class PipelineConfig:
@@ -51,6 +96,11 @@ class PipelineConfig:
     # 轉場緩衝與交通時間模型
     buffer_mins: float = 15.0
     travel_min_per_km: float = 3.0
+
+    # 勞動合規：累計連續工作達 continuous_work_limit_mins 分鐘，強制要求下一段任務
+    # 與前段之間至少間隔 mandatory_break_mins 分鐘（見 Phase 2 的 _build_break_constraints）。
+    continuous_work_limit_mins: float = 240.0
+    mandatory_break_mins: float = 30.0
 
     # Phase 1：軟性適配度評分
     base_score: float = 60.0
@@ -61,31 +111,148 @@ class PipelineConfig:
     continuity_satisfaction_threshold: float = 4.3
     satisfaction_baseline: float = 4.0
     satisfaction_weight: float = 10.0
-    travel_penalty_weight: float = 0.5
-    travel_penalty_cap: float = 15.0
+    travel_penalty_weight: float = 2.0
+    travel_penalty_cap: float = 25.0
     fatigue_reference_hours: float = 160.0
     fatigue_weight: float = 10.0
 
+    # Phase 1：車程上限硬性條件（None = 停用，不做硬性剔除）。
+    # 照護連續性優先於車程限制：一般候選人受 max_travel_minutes 限制，
+    # 但歷史首選居服員改用較寬鬆的 preferred_caregiver_max_travel_minutes
+    # （或直接不受限，若該欄位亦為 None），避免熟悉的居服員被車程微幅超標而剔除。
+    max_travel_minutes: Optional[float] = None
+    preferred_caregiver_max_travel_minutes: Optional[float] = None
+
     # Phase 2：OR-Tools 目標函數權重
-    objective_travel_weight: float = 0.5
+    # 注意：objective_travel_weight 僅套用在「非歷史首選居服員」的候選配對；
+    # 歷史首選居服員的配對在目標函數中略過此懲罰項（詳見 run_phase2_optimization），
+    # 確保調高車程懲罰以追求整體路線效率時，仍不會犧牲照護連續性。
+    objective_travel_weight: float = 3.0
     urgent_priority_bonus: float = 50.0
     normal_priority_bonus: float = 20.0
+
+    # 財務試算：長照申報點數換算居服員薪資的拆帳比例，以及營收併入目標函數的縮放權重
+    # （例如每 100 點營收 ≈ 5 分適配度分數增益，對齊分數與點數量級）。
+    caregiver_salary_rate_per_point: float = 0.65
+    revenue_score_weight: float = 0.05
 
 
 # ==========================================
 # 資料載入
 # ==========================================
-def load_data(excel_path: str = DEFAULT_EXCEL_PATH):
+def load_data(excel_path: str = DEFAULT_EXCEL_PATH, tasks_sheet_name: str = "Today_Pending_Tasks"):
+    """讀取派單資料庫四張工作表。
+
+    tasks_sheet_name 預設為現行單日排班格式的「Today_Pending_Tasks」；若改用含
+    星期／日期欄位的月批次排班資料表，呼叫端可傳入 "Monthly_Pending_Tasks"。
+    """
     if not os.path.exists(excel_path):
         raise FileNotFoundError(f"找不到檔案 {excel_path}，請確認檔案與腳本在同一目錄下。")
 
     df_cg = pd.read_excel(excel_path, sheet_name="Caregiver_Profiles")
     df_cl = pd.read_excel(excel_path, sheet_name="Client_Profiles")
-    df_tasks = pd.read_excel(excel_path, sheet_name="Today_Pending_Tasks")
+    df_tasks = pd.read_excel(excel_path, sheet_name=tasks_sheet_name)
     df_hist = pd.read_excel(excel_path, sheet_name="Historical_Service_Logs")
 
     tasks = df_tasks.merge(df_cl, on="案家ID", how="left")
     return df_cg, df_cl, df_tasks, df_hist, tasks
+
+
+def _get_task_field(row, base_col_name: str):
+    """依序嘗試 base_col_name、base_col_name_x、base_col_name_y，取得第一個有值的欄位。
+
+    新版月批次任務資料表的 Service_Code_1/2、Units_1/2 欄位，若在 Client_Profiles
+    亦重複定義同名欄位，經 `tasks_df.merge(df_cl, on="案家ID")` 合併後，pandas 會
+    自動將同名欄位改為 base_col_name_x（左表／任務本身）、base_col_name_y（右表／
+    案家）。本函式確保無論合併後欄位是否被加上後綴，皆優先取任務本身、其次取
+    案家層級的對應值，而不會因欄位改名誤判為「缺少代碼」。row 可為 Series 或 dict。
+    """
+    for col in (base_col_name, f"{base_col_name}_x", f"{base_col_name}_y"):
+        value = row.get(col)
+        if pd.notna(value) and str(value).strip():
+            return value
+    return None
+
+
+# ==========================================
+# 申報法規防呆：BA 服務代碼併報合規檢核
+# ==========================================
+def check_ba_code_compatibility(task_row) -> Optional[str]:
+    """檢查單一任務的 BA 服務代碼併報合規性（依長照給付支付基準併報規則）。
+
+    task_row 可為 DataFrame 的一列（Series）或 dict，僅需能以 `.get()` 取出
+    Service_Code_1 / Service_Code_2（或合併後帶 _x/_y 後綴的同名欄位，見
+    `_get_task_field`）。回傳 None 代表未發現已知違規；否則回傳違規說明文字。
+    本函式僅檢核並回報，不會自動剔除或修改任務——是否略過警告並放行進入排程，
+    由呼叫端（例如居督於 app.py 的人工複核介面）決定。
+    """
+    code1_raw = _get_task_field(task_row, "Service_Code_1")
+    code2_raw = _get_task_field(task_row, "Service_Code_2")
+    code1 = str(code1_raw).strip() if code1_raw is not None else ""
+    code2 = str(code2_raw).strip() if code2_raw is not None else ""
+    codes = {c for c in (code1, code2) if c}
+
+    if "BA01" in codes and ("BA07" in codes or "BA23" in codes):
+        return "違規：BA01（基本身體清潔）不可與 BA07/BA23（沐浴/洗頭）同時段併申報"
+
+    if "BA02" in codes and len(codes) > 1:
+        other_codes = codes - {"BA02"}
+        if not other_codes.issubset({"BA22"}):
+            return f"違規：BA02（基本日常照顧）除 BA22 外不得與其他項目 ({other_codes}) 評定併用"
+
+    if "BA01" in codes and "BA24" in codes:
+        return "注意：BA01 與 BA24 同時段申報可能涉及排泄項目重複，請確認計畫書核定內容"
+
+    return None
+
+
+def validate_ba_codes(tasks_df: pd.DataFrame) -> pd.DataFrame:
+    """對整批任務套用 check_ba_code_compatibility，回傳新增檢核欄位的副本。
+
+    新增「BA代碼檢核異常」（違規說明文字或 None）與「含違規代碼」（布林值）兩欄，
+    供派單前的法規防呆健檢（例如上傳資料後的即時檢核儀表板）使用；不修改傳入的
+    DataFrame，亦不會排除任何任務列。
+    """
+    result = tasks_df.copy()
+    messages = [check_ba_code_compatibility(row) for _, row in result.iterrows()]
+    result["BA代碼檢核異常"] = messages
+    result["含違規代碼"] = [m is not None for m in messages]
+    return result
+
+
+# ==========================================
+# 財務試算：長照申報點數（營收）與居服員拆帳薪資
+# ==========================================
+def calculate_task_revenue_and_salary(tasks_df: pd.DataFrame, config: "PipelineConfig") -> pd.DataFrame:
+    """試算每筆任務的長照申報點數（機構營收）與居服員拆帳薪資。
+
+    優先以 Service_Code_1/2 對照 BA_UNIT_POINTS 點數表 × Units_1/2 計算；若任務
+    缺乏服務代碼欄位（例如尚未升級至含 BA 碼申報欄位的資料表），退回以服務歷時
+    概算點數，確保任何資料版本皆能得到合理的營收估計。回傳新增兩欄位的副本，
+    不修改傳入的 DataFrame。
+    """
+    result = tasks_df.copy()
+    revenues = []
+    for _, row in result.iterrows():
+        rev = 0.0
+        for code_col, units_col in (("Service_Code_1", "Units_1"), ("Service_Code_2", "Units_2")):
+            code_raw = _get_task_field(row, code_col)
+            units_raw = _get_task_field(row, units_col)
+            code = str(code_raw).strip() if code_raw is not None else ""
+            units = float(units_raw) if units_raw is not None else 0.0
+            if code in BA_UNIT_POINTS:
+                rev += BA_UNIT_POINTS[code] * units
+
+        if rev == 0.0:
+            duration_raw = row.get("服務歷時(分鐘)")
+            duration_mins = float(duration_raw) if pd.notna(duration_raw) else 90.0
+            rev = (duration_mins / 30.0) * _FALLBACK_POINTS_PER_30MIN
+
+        revenues.append(rev)
+
+    result["預估長照申報點數(營收)"] = [round(r, 1) for r in revenues]
+    result["預估居服員拆帳薪資"] = [round(r * config.caregiver_salary_rate_per_point, 1) for r in revenues]
+    return result
 
 
 # ==========================================
@@ -238,31 +405,120 @@ def parse_time(time_str):
     )
 
 
-def _check_hard_constraints(task, cg, config: "PipelineConfig"):
+def _check_hard_constraints(
+    task,
+    cg,
+    config: "PipelineConfig",
+    travel_time_min: Optional[float] = None,
+    is_preferred_caregiver: bool = False,
+):
     """檢查單一 (任務, 居服員) 配對的硬性條件。全數通過回傳 None，否則回傳未通過原因。
 
-    抽成獨立函式供 Phase 1 過濾與「更新居服員原因」診斷共用同一套判斷邏輯。
+    抽成獨立函式供 Phase 1 過濾與「原首選替換原因」診斷共用同一套判斷邏輯。
+
+    星期對應／時間窗涵蓋／請假排除三項檢查，僅在 task／cg 實際具備對應欄位
+    （可排班星期、每日可服務時段_起/迄、請假或不排班日期、星期、日期）時才生效
+    ——以 `.get()` 取值，取不到（欄位不存在或為空）即直接跳過該檢查，因此舊版
+    僅有「今日既定行程」欄位、不含這些欄位的資料表行為完全不受影響。
+    車程上限檢查同理，僅在呼叫端提供 travel_time_min 且 config.max_travel_minutes
+    已設定（非 None）時才生效，預設為停用。
     """
+    # 以下訊息刻意採「無主語」寫法（不寫「居服員」/「原居服員」），因為本函式同時
+    # 供 Phase 1 一般候選人過濾（訊息僅供 reason_counts 內部除錯彙總）與
+    # `_diagnose_caregiver_change` 診斷「原首選居服員」共用；後者會在回傳訊息前
+    # 明確加上 `原首選居服員[ID]` 主語，若訊息本身也帶主語詞，會讓居督誤以為
+    # 訊息在描述「獲派居服員」而非「原首選居服員」，見任務一問題分析。
     req_gender = task["指定居服員性別"]
     if req_gender == "限女性" and cg["性別"] != "女":
-        return "案家指定女性居服員，原居服員性別不符"
+        return "案家指定女性居服員，性別不符"
     if req_gender == "限男性" and cg["性別"] != "男":
-        return "案家指定男性居服員，原居服員性別不符"
+        return "案家指定男性居服員，性別不符"
 
     if task["需重度移位協助(0/1)"] == 1 and cg["具備重度移位體力(0/1)"] == 0:
-        return "案家需重度移位協助，原居服員不具備相關體力條件"
+        return "案家需重度移位協助，不具備相關體力條件"
 
     cg_excl = cg["特殊排斥條件"]
     if cg_excl in EXCLUSION_MAP and task["案家環境特徵"] == EXCLUSION_MAP[cg_excl]:
-        return f"原居服員排斥「{EXCLUSION_MAP[cg_excl]}」環境條件"
+        return f"排斥「{EXCLUSION_MAP[cg_excl]}」環境條件"
+
+    # 星期對應檢查 (Day-of-Week Matching)：僅當「星期」／「可排班星期」欄位確實存在於
+    # 資料表中時才生效——用 `in task.index`／`in cg.index` 判斷「欄位是否存在」，而非
+    # 用 `pd.notna()` 判斷「儲存格是否為空」。這兩者過去被混為一談：欄位整體不存在
+    # （舊版資料表，理應跳過此檢查，維持向下相容）與欄位存在但「此列」資料缺漏或格式
+    # 無法解析（新版資料表的資料品質問題）都會落入同一個 if 分支被直接跳過，導致
+    # 可排班星期留空、或星期名稱格式不符的居服員被silently當作「全天候可排班」而通過
+    # 硬性限制——這正是「居服員當日不在可排班星期名單內，系統卻仍將其派單」的根因。
+    # 欄位存在時，資料缺漏或無法解析一律保守判定為不通過（fail-closed）並印出警告，
+    # 而非靜默放行（fail-open）。
+    has_weekday_cols = "星期" in task.index and "可排班星期" in cg.index
+    if has_weekday_cols:
+        task_weekday = task.get("星期")
+        allowed_days_str = cg.get("可排班星期")
+        cg_id_for_log = cg.get("居服員ID", "?")
+        task_id_for_log = task.get("任務ID", "?")
+        if pd.isna(task_weekday) or pd.isna(allowed_days_str) or str(allowed_days_str).strip() == "":
+            print(
+                f"[Hard Constraint Warning] 任務 {task_id_for_log} 或居服員 {cg_id_for_log} "
+                f"的「星期」／「可排班星期」欄位資料缺漏，保守判定當日不可派單。"
+            )
+            return "星期或可排班星期資料缺漏，保守判定當日不可派單"
+
+        task_wd_num = WEEKDAY_NAME_TO_NUM.get(str(task_weekday).strip())
+        if task_wd_num is None:
+            print(
+                f"[Hard Constraint Warning] 任務 {task_id_for_log} 的「星期」欄位值"
+                f"「{task_weekday}」無法辨識，保守判定當日不可派單。"
+            )
+            return "任務星期欄位格式無法辨識，保守判定當日不可派單"
+
+        allowed_days = [int(d.strip()) for d in str(allowed_days_str).split(",") if d.strip().isdigit()]
+        if not allowed_days:
+            print(
+                f"[Hard Constraint Warning] 居服員 {cg_id_for_log} 的「可排班星期」欄位值"
+                f"「{allowed_days_str}」無法解析出任何星期，保守判定當日不可派單。"
+            )
+            return "可排班星期欄位格式無法解析，保守判定當日不可派單"
+
+        if task_wd_num not in allowed_days:
+            return "當日不排班（不在可排班星期名單）"
+
+    # 時間窗涵蓋檢查 (Time Window Overlap)：僅當居服員有每日可服務時段欄位時生效
+    cg_start_str = cg.get("每日可服務時段_起")
+    cg_end_str = cg.get("每日可服務時段_迄")
+    if pd.notna(cg_start_str) and pd.notna(cg_end_str):
+        t_start = datetime.strptime(str(task["時間窗_開始"]).strip(), "%H:%M")
+        t_end = datetime.strptime(str(task["時間窗_結束"]).strip(), "%H:%M")
+        c_start = datetime.strptime(str(cg_start_str).strip(), "%H:%M")
+        c_end = datetime.strptime(str(cg_end_str).strip(), "%H:%M")
+        if not (t_start >= c_start and t_end <= c_end):
+            return "任務時段超出每日可服務時段範圍"
+
+    # 請假或不排班日期排除 (Leave Exclusion)：僅當任務有「日期」、居服員有請假日期欄位時生效
+    leave_dates_str = cg.get("請假或不排班日期")
+    task_date = task.get("日期")
+    if pd.notna(leave_dates_str) and pd.notna(task_date) and str(leave_dates_str).strip() not in ("", "無"):
+        leave_list = [d.strip() for d in str(leave_dates_str).split(",") if d.strip()]
+        task_date_str = str(task_date).split(" ")[0]
+        if task_date_str in leave_list:
+            return "當日已有請假或不排班記錄"
 
     task_duration_hrs = task["服務歷時(分鐘)"] / 60.0
-    if cg["今日已佔用工時(小時)"] + task_duration_hrs > cg["每日工時上限(小時)"]:
-        return "原居服員今日工時已達每日上限"
+    if cg.get("今日已佔用工時(小時)", 0.0) + task_duration_hrs > cg["每日工時上限(小時)"]:
+        return "今日工時已達每日上限"
+
+    # 車程上限，惟「照護連續性」優先於「車程限制」：一般候選人受 max_travel_minutes
+    # 限制，但歷史首選居服員改採較寬鬆的 preferred_caregiver_max_travel_minutes（或
+    # 沿用同一上限，若未另行設定），確保熟悉度高的居服員不因車程稍長就被硬性剔除。
+    if config.max_travel_minutes is not None and travel_time_min is not None:
+        cap = config.max_travel_minutes
+        if is_preferred_caregiver and config.preferred_caregiver_max_travel_minutes is not None:
+            cap = config.preferred_caregiver_max_travel_minutes
+        if travel_time_min > cap:
+            return f"預估車程({travel_time_min:.0f}分)超過上限({cap:.0f}分鐘)"
 
     required_certs = SPECIAL_CERT_REQUIREMENTS.get(task["特殊照護需求"])
     if required_certs and cg["核心專長證照"] not in required_certs:
-        return "原居服員缺乏該需求類別之法定專長認證"
+        return "缺乏該需求類別之法定專長認證"
 
     return None
 
@@ -289,13 +545,28 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
         pref_cg = task["歷史首選居服員ID"]
         req_type = task["特殊照護需求"]
 
+        matched_count_for_task = 0
+        reason_counts: dict = {}
+
         for _, cg in df_cg.iterrows():
             cg_id = cg["居服員ID"]
+            is_preferred = cg_id == pref_cg
+
+            travel_time_min = calc_travel_minutes(
+                cg["服務起點_緯度(家)"],
+                cg["服務起點_經度(家)"],
+                client_lat,
+                client_lon,
+                config,
+            )
 
             # --- Hard Constraints (硬性過濾，不合格者直接剔除) ---
-            if _check_hard_constraints(task, cg, config) is not None:
+            err_msg = _check_hard_constraints(task, cg, config, travel_time_min, is_preferred)
+            if err_msg is not None:
+                reason_counts[err_msg] = reason_counts.get(err_msg, 0) + 1
                 continue
 
+            matched_count_for_task += 1
             cert = cg["核心專長證照"]
 
             # --- Soft Match Scoring ---
@@ -309,7 +580,7 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
             elif req_type in ["管路安全與特殊日常照護", "餐食照顧/管灌"] and cert == "單一級照服證照":
                 score += config.cert_bonus_other
 
-            if cg_id == pref_cg:
+            if is_preferred:
                 # 照護連續性為最高指導原則：基礎加分已大幅提高，避免微幅車程/成本優化
                 # 就任意更換案家熟悉的居服員；表現優良（滿意度達門檻）者再疊加動態加成。
                 score += config.preferred_caregiver_bonus
@@ -317,14 +588,6 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
                     score += config.continuity_performance_bonus
 
             score += (cg["歷史滿意度均值"] - config.satisfaction_baseline) * config.satisfaction_weight
-
-            travel_time_min = calc_travel_minutes(
-                cg["服務起點_緯度(家)"],
-                cg["服務起點_經度(家)"],
-                client_lat,
-                client_lon,
-                config,
-            )
             score -= min(travel_time_min * config.travel_penalty_weight, config.travel_penalty_cap)
 
             intensity_weight = get_service_intensity_weight(task)
@@ -349,6 +612,9 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
                 }
             )
 
+        if matched_count_for_task == 0:
+            print(f"[Match Warning] 任務 {t_id} 找不到任何符合條件的居服員，剔除原因分佈：{reason_counts}")
+
     return pd.DataFrame(match_results)
 
 
@@ -363,8 +629,14 @@ def _diagnose_caregiver_change(
     task_times: dict,
     config: "PipelineConfig",
 ) -> str:
-    """回傳「更新居服員原因」文字。案家為新客戶（無歷史首選居服員）或本次
-    仍指派給原居服員時回傳空字串；僅在確實更換居服員時才需要說明原因。
+    """回傳「原首選替換原因」文字，說明*歷史首選居服員*為何未獲派本次任務。
+
+    案家為新客戶（無歷史首選居服員）或本次仍指派給原首選居服員時回傳空字串；
+    僅在確實更換居服員時才需要說明原因。
+
+    回傳字串一律以 `原首選居服員[ID]` 開頭明確帶出主語，避免與「本次獲派居服員」
+    混淆——過去訊息（如「居服員當日不在可排班星期名單內」）沒有主語，居督容易誤讀
+    成是在描述獲派居服員不符資格，但其實描述的是原首選居服員被替換的原因。
     """
     if pd.isna(pref_cg_id) or str(pref_cg_id).strip() == "":
         return ""
@@ -372,17 +644,30 @@ def _diagnose_caregiver_change(
         return ""
 
     t_id = task_row["任務ID"]
+    subject = f"原首選居服員[{pref_cg_id}]"
 
     pref_in_matches = ((df_matches["任務ID"] == t_id) & (df_matches["居服員ID"] == pref_cg_id)).any()
     if not pref_in_matches:
         cg_rows = df_cg[df_cg["居服員ID"] == pref_cg_id]
         if cg_rows.empty:
-            return "原居服員資料異動，查無此居服員"
-        return _check_hard_constraints(task_row, cg_rows.iloc[0], config) or "原居服員不符合硬性派單條件"
+            return f"{subject}資料異動，系統查無此居服員"
+        cg_row = cg_rows.iloc[0]
+        travel_time_min = calc_travel_minutes(
+            cg_row["服務起點_緯度(家)"],
+            cg_row["服務起點_經度(家)"],
+            task_row["服務地點_緯度"],
+            task_row["服務地點_經度"],
+            config,
+        )
+        detail = (
+            _check_hard_constraints(task_row, cg_row, config, travel_time_min, is_preferred_caregiver=True)
+            or "不符合硬性派單條件"
+        )
+        return f"{subject}{detail}"
 
     pref_in_valid = ((df_valid["任務ID"] == t_id) & (df_valid["居服員ID"] == pref_cg_id)).any()
     if not pref_in_valid:
-        return "原居服員今日既定行程與本任務時段衝突"
+        return f"{subject}今日既定行程與本任務時段衝突"
 
     t_start, t_end, t_lat, t_lon = task_times[t_id]
     for other_t_id in other_assigned_task_ids:
@@ -392,9 +677,106 @@ def _diagnose_caregiver_change(
             t_end + timedelta(minutes=travel_mins) <= o_start
             or o_end + timedelta(minutes=travel_mins) <= t_start
         ):
-            return "原居服員該時段已媒合其他案家任務"
+            return f"{subject}該時段已媒合其他案家任務"
 
-    return "原居服員符合派單資格，惟系統整體最佳化後綜合適配分數較低，改派其他居服員"
+    return f"{subject}雖符合派單資格，惟系統整體最佳化後綜合適配分數較低，已改派其他居服員"
+
+
+def _build_cg_busy_blocks(df_cg: pd.DataFrame) -> dict:
+    """建立居服員今日既定行程時間阻擋塊 (Time Blocks)，回傳 cg_id -> [(start, end, lat, lon), ...]。
+
+    「今日既定行程」欄位為新版月批次排班資料表所無（改以可排班星期/請假日期取代），
+    以 `.get()` 取值使兩種資料表格式皆可安全運作：欄位不存在時回傳 None，
+    parse_time 會將 None 視為「無既定行程」而正確跳過。
+    """
+    cg_busy = {}
+    for _, cg in df_cg.iterrows():
+        cg_id = cg["居服員ID"]
+        busy_intervals = []
+        for i in [1, 2]:
+            t1, t2 = parse_time(cg.get(f"今日既定行程{i}_時段"))
+            if t1:
+                busy_intervals.append(
+                    (
+                        t1,
+                        t2,
+                        cg.get(f"今日既定行程{i}_地點緯度"),
+                        cg.get(f"今日既定行程{i}_地點經度"),
+                    )
+                )
+        cg_busy[cg_id] = busy_intervals
+    return cg_busy
+
+
+def _build_break_constraints(solver, X: dict, df_valid: pd.DataFrame, cg_busy: dict, task_times: dict, config: "PipelineConfig") -> None:
+    """規則1（勞動合規）：居服員累計連續工作達 config.continuous_work_limit_mins 分鐘，
+    強制要求下一段任務與前段之間至少間隔 config.mandatory_break_mins 分鐘。
+
+    做法：對每位居服員，把「今日既定行程」（固定發生）與「通過衝突檢查的候選新任務」
+    （指派變數）依開始時間排序，切出「潛在連續鏈」——鏈內相鄰兩區塊的固定時間差
+    < mandatory_break_mins。對鏈中每一個起點，往後累加工作分鐘數直到達到門檻，
+    即對緊接在後的區塊加入限制式，禁止「該起點到達門檻的前綴」與「緊接的下一個
+    候選任務」同時獲派（前綴若全為既有既定行程，則後續候選任務直接被禁止指派）。
+
+    此為保守近似：以「潛在鏈上的固定時間」計算，而非僅以「實際獲派子集合」重新
+    計算，在極少數「跳過鏈中某段候選任務即可讓實際連續工時縮短」的邊界情況下可能
+    偏嚴（阻擋一個其實合規的組合），但休息規則屬勞動合規要求，寧可偏保守也不可
+    漏判真違規；居督仍可透過既有人工覆寫機制（save_override_log）調整結果。
+    """
+    for cg_id in df_valid["居服員ID"].unique():
+        blocks = []
+        for b_start, b_end, _b_lat, _b_lon in cg_busy.get(cg_id, []):
+            blocks.append(
+                {"start": b_start, "end": b_end, "duration_min": (b_end - b_start).total_seconds() / 60.0, "var": None}
+            )
+        for t_id in df_valid[df_valid["居服員ID"] == cg_id]["任務ID"].unique():
+            t_start, t_end, _, _ = task_times[t_id]
+            blocks.append(
+                {
+                    "start": t_start,
+                    "end": t_end,
+                    "duration_min": (t_end - t_start).total_seconds() / 60.0,
+                    "var": X[(t_id, cg_id)],
+                }
+            )
+        blocks.sort(key=lambda b: b["start"])
+
+        # 依固定時間切出潛在連續鏈：鏈內相鄰區塊時間差 < mandatory_break_mins
+        i = 0
+        n = len(blocks)
+        while i < n:
+            j = i + 1
+            while j < n:
+                gap_mins = (blocks[j]["start"] - blocks[j - 1]["end"]).total_seconds() / 60.0
+                if gap_mins >= config.mandatory_break_mins:
+                    break
+                j += 1
+            chain = blocks[i:j]
+
+            # 對鏈中每個起點 k，找出往後累加達門檻的最短前綴 [k..m]，並限制其後一個
+            # 候選任務不得與該前綴同時獲派。
+            for k in range(len(chain)):
+                cum = 0.0
+                m = None
+                for idx in range(k, len(chain)):
+                    cum += chain[idx]["duration_min"]
+                    if cum >= config.continuous_work_limit_mins:
+                        m = idx
+                        break
+                if m is None or m + 1 >= len(chain):
+                    continue
+
+                extra = chain[m + 1]
+                if extra["var"] is None:
+                    continue  # 既有既定行程本身即固定發生，無法以指派變數禁止
+
+                prefix_vars = [b["var"] for b in chain[k : m + 1] if b["var"] is not None]
+                if not prefix_vars:
+                    solver.Add(extra["var"] == 0)
+                else:
+                    solver.Add(sum(prefix_vars) + extra["var"] <= len(prefix_vars))
+
+            i = j
 
 
 # ==========================================
@@ -405,24 +787,20 @@ def run_phase2_optimization(
     tasks: pd.DataFrame,
     df_cg: pd.DataFrame,
     config: PipelineConfig,
+    extra_busy_blocks: Optional[dict] = None,
 ):
-    # 建立居服員今日既定行程時間阻擋塊 (Time Blocks)
-    cg_busy = {}
-    for _, cg in df_cg.iterrows():
-        cg_id = cg["居服員ID"]
-        busy_intervals = []
-        for i in [1, 2]:
-            t1, t2 = parse_time(cg[f"今日既定行程{i}_時段"])
-            if t1:
-                busy_intervals.append(
-                    (
-                        t1,
-                        t2,
-                        cg[f"今日既定行程{i}_地點緯度"],
-                        cg[f"今日既定行程{i}_地點經度"],
-                    )
-                )
-        cg_busy[cg_id] = busy_intervals
+    """執行 Phase 2 時空衝突過濾與 OR-Tools 最佳化派單。
+
+    extra_busy_blocks（cg_id -> [(start, end, lat, lon), ...]，可選）用於「週期性任務
+    優先」排班：由呼叫端（見 `_run_periodic_then_adhoc`）將前一輪已鎖定的週期性任務
+    指派結果，轉為額外的忙碌時間區塊注入本輪臨時單次任務的衝突檢查，使臨時任務
+    只能競爭週期性任務排定後剩餘的時段，不會與其重疊。
+    """
+    # 建立居服員今日既定行程時間阻擋塊 (Time Blocks)。
+    cg_busy = _build_cg_busy_blocks(df_cg)
+    if extra_busy_blocks:
+        for cg_id, blocks in extra_busy_blocks.items():
+            cg_busy.setdefault(cg_id, []).extend(blocks)
 
     # 建立任務時間表
     task_times = {}
@@ -510,6 +888,9 @@ def run_phase2_optimization(
                 ):
                     solver.Add(X[(t1_id, cg_id)] + X[(t2_id, cg_id)] <= 1)
 
+    # 限制條件 2b：規則1（4小時/30分鐘休息）——累計連續工作達門檻須強制安插休息。
+    _build_break_constraints(solver, X, df_valid, cg_busy, task_times, config)
+
     # 限制條件 3：居服員今日新派任務總歷時 + 既有已佔用工時，不得超過每日工時上限。
     # Phase 1 僅逐筆過濾單一任務是否超時，無法阻擋「多筆任務加總後超派」的組合，
     # 此為求解器層級的產能限制式，修復該缺口。
@@ -517,7 +898,7 @@ def run_phase2_optimization(
         row["任務ID"]: row["服務歷時(分鐘)"] / 60.0 for _, row in tasks.iterrows()
     }
     cg_capacity = {
-        row["居服員ID"]: (row["今日已佔用工時(小時)"], row["每日工時上限(小時)"])
+        row["居服員ID"]: (row.get("今日已佔用工時(小時)", 0.0), row["每日工時上限(小時)"])
         for _, row in df_cg.iterrows()
     }
     for cg_id in df_valid["居服員ID"].unique():
@@ -529,9 +910,26 @@ def run_phase2_optimization(
             <= cap_hours
         )
 
-    # 目標函數：Z = 適配度分數 - w*交通時間 + 優先級權重
+    # 財務試算：每筆任務的長照申報點數（營收）與居服員拆帳薪資，供目標函數與輸出結果共用。
+    tasks_with_revenue = calculate_task_revenue_and_salary(tasks, config)
+    task_revenue_map = {
+        row["任務ID"]: (row["預估長照申報點數(營收)"], row["預估居服員拆帳薪資"])
+        for _, row in tasks_with_revenue.iterrows()
+    }
+    task_pref_cg_map = {row["任務ID"]: row["歷史首選居服員ID"] for _, row in tasks.iterrows()}
+
+    # 目標函數：Z = 適配度分數 - w*交通時間 + 優先級權重 + 財務營收權重
+    #
+    # 「照護連續性」優先於「車程限制」的原則亦須貫徹到此目標函數層級：若僅單純調高
+    # objective_travel_weight 以追求整體路線效率，未加區別地套用在所有候選配對上，
+    # 反而會讓車程較遠但為案家歷史首選的居服員，在整體最佳化階段被距離較近的陌生
+    # 居服員取代——這違背了 Phase 1 刻意給予首選居服員高額連續性加分的用意（其車程
+    # 成本已由 Phase 1 的 travel_penalty_cap 合理封頂）。因此歷史首選居服員的配對在
+    # 此處略過 objective_travel_weight 懲罰項，僅一般候選人受其約束。
     objective = solver.Objective()
     for _, row in df_valid.iterrows():
+        t_id = row["任務ID"]
+        cg_id = row["居服員ID"]
         w_match = row["適配度分數"]
         w_travel = row["預估交通時間(分)"]
         priority_bonus = (
@@ -540,8 +938,14 @@ def run_phase2_optimization(
             else config.normal_priority_bonus
         )
 
-        coeff = w_match - (config.objective_travel_weight * w_travel) + priority_bonus
-        objective.SetCoefficient(X[(row["任務ID"], row["居服員ID"])], coeff)
+        is_preferred = cg_id == task_pref_cg_map.get(t_id)
+        travel_penalty_term = 0.0 if is_preferred else config.objective_travel_weight * w_travel
+
+        revenue, _salary = task_revenue_map.get(t_id, (0.0, 0.0))
+        revenue_score = revenue * config.revenue_score_weight
+
+        coeff = w_match - travel_penalty_term + priority_bonus + revenue_score
+        objective.SetCoefficient(X[(t_id, cg_id)], coeff)
 
     objective.SetMaximization()
 
@@ -557,6 +961,7 @@ def run_phase2_optimization(
                 row_data = df_valid[
                     (df_valid["任務ID"] == t_id) & (df_valid["居服員ID"] == cg_id)
                 ].iloc[0]
+                revenue, salary = task_revenue_map.get(t_id, (0.0, 0.0))
                 results.append(
                     {
                         "任務ID": t_id,
@@ -568,10 +973,12 @@ def run_phase2_optimization(
                         "任務優先級": row_data["優先級"],
                         "地點緯度": row_data["地點緯度"],
                         "地點經度": row_data["地點經度"],
+                        "預估長照申報點數(營收)": revenue,
+                        "預估居服員拆帳薪資": salary,
                     }
                 )
 
-        # 每位居服員本次新指派到的任務清單，供「更新居服員原因」判斷同時段衝突用
+        # 每位居服員本次新指派到的任務清單，供「原首選替換原因」判斷同時段衝突用
         assigned_task_ids_by_cg = {}
         for row in results:
             assigned_task_ids_by_cg.setdefault(row["派單居服員"], []).append(row["任務ID"])
@@ -583,7 +990,7 @@ def run_phase2_optimization(
             other_task_ids = [
                 tid for tid in assigned_task_ids_by_cg.get(pref_cg_id, []) if tid != t_id
             ]
-            row["更新居服員原因"] = _diagnose_caregiver_change(
+            row["原首選替換原因"] = _diagnose_caregiver_change(
                 task_row,
                 pref_cg_id,
                 row["派單居服員"],
@@ -602,6 +1009,184 @@ def run_phase2_optimization(
         result["assigned_count"] = assigned_count
 
     return result
+
+
+PERIODIC_TASK_COLUMN = "是否為週期性任務"
+
+
+def _is_periodic_task(value) -> bool:
+    """將「是否為週期性任務」欄位值正規化為布林值。
+
+    Excel 布林儲存格經 pandas 讀入後，實際型別可能是原生 Python bool（勾選格式）、
+    字串 "TRUE"/"FALSE"（文字格式儲存格）、或 1/0；本函式統一正規化為 bool，
+    空白（NaN）保守視為非週期性（臨時單次）任務。
+    """
+    if pd.isna(value):
+        return False
+    if isinstance(value, str):
+        return value.strip().upper() == "TRUE"
+    return bool(value)
+
+
+def _split_periodic_tasks(tasks: pd.DataFrame, periodic_column: str = PERIODIC_TASK_COLUMN):
+    """依 periodic_column 將 tasks 拆分為 (週期性任務, 臨時單次任務)。
+
+    欄位不存在時回傳 (None, None)，代表呼叫端應維持原本單一批次排班邏輯
+    （向下相容不含此欄位的舊版資料表）。
+    """
+    if periodic_column not in tasks.columns:
+        return None, None
+    is_periodic = tasks[periodic_column].apply(_is_periodic_task)
+    return tasks[is_periodic].copy(), tasks[~is_periodic].copy()
+
+
+def _run_periodic_then_adhoc(
+    periodic_tasks: pd.DataFrame,
+    adhoc_tasks: pd.DataFrame,
+    df_cg: pd.DataFrame,
+    config: PipelineConfig,
+) -> dict:
+    """規則2：週期性排班優先於臨時單次排班。
+
+    先只用週期性任務跑一輪 Phase 1 + Phase 2，鎖定基礎班表；再將該輪指派結果轉為
+    額外忙碌時間區塊與已佔用工時，注入臨時單次任務的第二輪 Phase 1 + Phase 2，
+    使臨時任務只能競爭週期性任務排定後「剩餘的居服員產能與時段」，不會與其重疊
+    或反過來排擠週期性任務。
+    """
+    empty_result = {"df_valid": pd.DataFrame(), "status": None, "df_result": pd.DataFrame(), "assigned_count": 0}
+
+    periodic_result = empty_result
+    if not periodic_tasks.empty:
+        periodic_matches = run_phase1_matching(periodic_tasks, df_cg, config)
+        periodic_result = run_phase2_optimization(periodic_matches, periodic_tasks, df_cg, config)
+
+    df_cg_adhoc = df_cg.copy()
+    extra_busy_blocks: dict = {}
+    df_periodic_result = periodic_result["df_result"]
+    if not df_periodic_result.empty:
+        if "今日已佔用工時(小時)" not in df_cg_adhoc.columns:
+            df_cg_adhoc["今日已佔用工時(小時)"] = 0.0
+
+        periodic_tasks_by_id = periodic_tasks.set_index("任務ID")
+        hours_by_cg: dict = {}
+        for _, row in df_periodic_result.iterrows():
+            t_id = row["任務ID"]
+            cg_id = row["派單居服員"]
+            task_row = periodic_tasks_by_id.loc[t_id]
+            t_start = datetime.strptime(str(task_row["時間窗_開始"]).strip(), "%H:%M")
+            t_end = datetime.strptime(str(task_row["時間窗_結束"]).strip(), "%H:%M")
+            extra_busy_blocks.setdefault(cg_id, []).append(
+                (t_start, t_end, task_row["服務地點_緯度"], task_row["服務地點_經度"])
+            )
+            hours_by_cg[cg_id] = hours_by_cg.get(cg_id, 0.0) + task_row["服務歷時(分鐘)"] / 60.0
+
+        for cg_id, hrs in hours_by_cg.items():
+            mask = df_cg_adhoc["居服員ID"] == cg_id
+            df_cg_adhoc.loc[mask, "今日已佔用工時(小時)"] = (
+                df_cg_adhoc.loc[mask, "今日已佔用工時(小時)"].fillna(0.0) + hrs
+            )
+
+    adhoc_result = empty_result
+    if not adhoc_tasks.empty:
+        adhoc_matches = run_phase1_matching(adhoc_tasks, df_cg_adhoc, config)
+        adhoc_result = run_phase2_optimization(
+            adhoc_matches, adhoc_tasks, df_cg_adhoc, config, extra_busy_blocks=extra_busy_blocks
+        )
+
+    df_valid = pd.concat([periodic_result["df_valid"], adhoc_result["df_valid"]], ignore_index=True)
+    df_result = pd.concat([df_periodic_result, adhoc_result["df_result"]], ignore_index=True)
+    if not df_result.empty:
+        df_result = df_result.sort_values(by="任務ID")
+
+    return {
+        "df_valid": df_valid,
+        "df_result": df_result,
+        "status": adhoc_result["status"] if not adhoc_tasks.empty else periodic_result["status"],
+        "assigned_count": periodic_result["assigned_count"] + adhoc_result["assigned_count"],
+    }
+
+
+# ==========================================
+# 全月/按日批次派單：對每個日期各自執行 Phase 1 + Phase 2
+# ==========================================
+def run_monthly_batch_dispatch(
+    tasks: pd.DataFrame,
+    df_cg: pd.DataFrame,
+    config: PipelineConfig,
+    date_column: str = "日期",
+) -> dict:
+    """依 `date_column`（預設「日期」）逐日切分 tasks，對每個日期各自獨立執行
+    Phase 1 適配度評分與 Phase 2 OR-Tools 最佳化，再彙整為全期間派單總表。
+
+    採「逐日各自求解」而非把整月任務一次丟進單一 MIP，原因有二：(1) 居服員的
+    每日工時上限、既定行程衝突等限制式本質上就是以「日」為單位獨立成立，不同
+    日期之間彼此不影響，逐日求解不損失最適性；(2) 任務規模隨天數線性成長時，
+    單一大型 MIP 的求解時間會遠超逐日拆解後個別求解時間的總和。
+
+    僅適用於 tasks 具備 date_column 欄位的月批次排班資料表（例如
+    「Monthly_Pending_Tasks」）；若傳入不含該欄位的單日排班資料表，會直接拋出
+    KeyError，提醒呼叫端改用 run_phase1_matching / run_phase2_optimization
+    的單次呼叫方式。
+
+    規則2（週期性排班優先）：若 tasks 具備 PERIODIC_TASK_COLUMN
+    （"是否為週期性任務"）欄位，每天會先鎖定週期性任務的班表，臨時單次任務只能
+    競爭剩餘產能／時段（見 `_run_periodic_then_adhoc`）；欄位不存在則維持原本
+    單一批次邏輯，向下相容不含此欄位的資料表。
+
+    規則5（月排班動態時數滾動）：內部維護一份 df_cg 的可變工作副本
+    `df_cg_working`，每完成一天的指派後，將當天各居服員實際獲派的服務時數
+    累加回其「當月累計服務時數(疲勞度)」欄位，供隔天 Phase 1 疲勞度懲罰納入計算
+    （偏好派給累計時數較少者），以達到勞逸均衡；傳入的 df_cg 本身不會被修改。
+    """
+    daily_results: dict = {}
+    result_frames = []
+    total_assigned_count = 0
+
+    df_cg_working = df_cg.copy()
+    if "當月累計服務時數(疲勞度)" not in df_cg_working.columns:
+        df_cg_working["當月累計服務時數(疲勞度)"] = 0.0
+
+    unique_dates = sorted(tasks[date_column].dropna().unique())
+    for target_date in unique_dates:
+        day_tasks = tasks[tasks[date_column] == target_date].copy()
+        if day_tasks.empty:
+            continue
+
+        periodic_tasks, adhoc_tasks = _split_periodic_tasks(day_tasks)
+        if periodic_tasks is None:
+            df_matches_daily = run_phase1_matching(day_tasks, df_cg_working, config)
+            phase2_daily = run_phase2_optimization(df_matches_daily, day_tasks, df_cg_working, config)
+        else:
+            phase2_daily = _run_periodic_then_adhoc(periodic_tasks, adhoc_tasks, df_cg_working, config)
+
+        daily_results[target_date] = phase2_daily
+
+        df_daily_result = phase2_daily["df_result"]
+        if not df_daily_result.empty:
+            df_daily_result = df_daily_result.copy()
+            df_daily_result["排班日期"] = target_date
+            result_frames.append(df_daily_result)
+            total_assigned_count += phase2_daily["assigned_count"]
+
+            day_tasks_by_id = day_tasks.set_index("任務ID")
+            hours_by_cg: dict = {}
+            for _, row in df_daily_result.iterrows():
+                t_id = row["任務ID"]
+                cg_id = row["派單居服員"]
+                duration_hrs = day_tasks_by_id.loc[t_id, "服務歷時(分鐘)"] / 60.0
+                hours_by_cg[cg_id] = hours_by_cg.get(cg_id, 0.0) + duration_hrs
+            for cg_id, hrs in hours_by_cg.items():
+                mask = df_cg_working["居服員ID"] == cg_id
+                df_cg_working.loc[mask, "當月累計服務時數(疲勞度)"] += hrs
+
+    df_result_all = pd.concat(result_frames, ignore_index=True) if result_frames else pd.DataFrame()
+
+    return {
+        "daily_results": daily_results,
+        "df_result_all": df_result_all,
+        "total_assigned_count": total_assigned_count,
+        "total_task_count": len(tasks),
+    }
 
 
 # ==========================================
