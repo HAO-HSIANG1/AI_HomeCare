@@ -28,6 +28,7 @@ import seaborn as sns
 import streamlit as st
 from ortools.linear_solver import pywraplp
 
+from calendar_view import render_calendar_overview
 from caregiver_engine import (
     DEFAULT_EXCEL_PATH,
     PipelineConfig,
@@ -432,6 +433,11 @@ if "last_result" in st.session_state:
         "預估居服員拆帳總薪資", f"{total_salary:,.0f} 元",
         help=f"申報點數 × 側邊欄設定的拆帳比例（目前 {salary_rate_pct}%）加總。",
     )
+
+    # 月曆班表總覽：純前端彙總既有派單結果與居服員資料表，不重呼叫任何排班演算法
+    # （見 calendar_view.py）；作為整個結果區的「首頁總覽」，置於 KPI 之後、
+    # 派單分析儀表板之前。
+    render_calendar_overview(df_result, df_tasks, res.get("df_cg", pd.DataFrame()))
 
     st.subheader("📊 派單分析儀表板")
     if df_matches.empty:
