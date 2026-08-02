@@ -507,13 +507,13 @@ def _check_hard_constraints(
         return "今日工時已達每日上限"
 
     # 車程上限，惟「照護連續性」優先於「車程限制」：一般候選人受 max_travel_minutes
-    # 限制，但歷史首選居服員改採較寬鬆的 preferred_caregiver_max_travel_minutes（或
-    # 沿用同一上限，若未另行設定），確保熟悉度高的居服員不因車程稍長就被硬性剔除。
-    if config.max_travel_minutes is not None and travel_time_min is not None:
-        cap = config.max_travel_minutes
-        if is_preferred_caregiver and config.preferred_caregiver_max_travel_minutes is not None:
-            cap = config.preferred_caregiver_max_travel_minutes
-        if travel_time_min > cap:
+    # 限制（None = 不設限），但歷史首選居服員改採獨立的
+    # preferred_caregiver_max_travel_minutes 上限——若該欄位亦為 None，代表歷史首選
+    # 居服員完全不受車程上限約束，不會退回套用一般候選人的 max_travel_minutes，
+    # 確保熟悉度高的居服員不因車程稍長就被硬性剔除。
+    if travel_time_min is not None:
+        cap = config.preferred_caregiver_max_travel_minutes if is_preferred_caregiver else config.max_travel_minutes
+        if cap is not None and travel_time_min > cap:
             return f"預估車程({travel_time_min:.0f}分)超過上限({cap:.0f}分鐘)"
 
     required_certs = SPECIAL_CERT_REQUIREMENTS.get(task["特殊照護需求"])
