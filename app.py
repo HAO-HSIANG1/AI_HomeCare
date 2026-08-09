@@ -38,7 +38,7 @@ from caregiver_engine import (
 # 直接隨 repo 附帶一份開源中文字型（Noto Sans TC, SIL Open Font License），
 # 因為系統套件（packages.txt: fonts-noto-cjk）是否真的裝進 Streamlit Cloud 容器、
 # 以及字型註冊名稱是否符合猜測，皆不受我們控制；自帶字型檔可確保任何部署環境
-# 都一定找得到，不必依賴系統/雲端環境是否裝好中文字型。
+# 都一定找得到，不必依賴系統/雲端環境是否裝好中文字型。。
 _BUNDLED_FONT_PATH = pathlib.Path(__file__).parent / "assets" / "fonts" / "NotoSansTC-Regular.ttf"
 
 
