@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from caregiver_engine import (
     PipelineConfig,
+    check_reassignment_conflict,
+    rank_candidates_by_availability,
     run_monthly_batch_dispatch,
     run_phase1_matching,
     run_phase2_optimization,
@@ -543,6 +545,207 @@ class MonthlyFatigueRollingTests(unittest.TestCase):
 
         self.assertEqual(df_result_all.loc["TK_DAY1", "派單居服員"], "CG_A")
         self.assertEqual(df_result_all.loc["TK_DAY2", "派單居服員"], "CG_B")
+
+
+class QuickReassignConflictTests(unittest.TestCase):
+    """月曆視角「一鍵調班」的即時衝突檢查（check_reassignment_conflict）。"""
+
+    def _tasks(self, rows):
+        return pd.DataFrame(rows)
+
+    def test_no_conflict_when_gap_covers_travel_and_buffer(self):
+        config = PipelineConfig()
+        df_tasks = self._tasks([
+            {"任務ID": "T1", "案家ID": "C1", "日期": "2026-08-17", "時間窗_開始": "09:00", "時間窗_結束": "10:00", "服務歷時(分鐘)": 60},
+            {"任務ID": "T2", "案家ID": "C2", "日期": "2026-08-17", "時間窗_開始": "10:30", "時間窗_結束": "11:00", "服務歷時(分鐘)": 30},
+        ])
+        df_result = pd.DataFrame([{"任務ID": "T1", "派單居服員": "CG1"}])
+        df_cg = pd.DataFrame([{"居服員ID": "CG1", "每日工時上限(小時)": 8.0}])
+        locations = {"T1": (25.05, 121.55), "T2": (25.05, 121.55)}
+
+        err = check_reassignment_conflict("T2", "CG1", df_tasks, df_result, df_cg, config, task_locations=locations)
+        self.assertIsNone(err)
+
+    def test_conflict_when_transition_buffer_not_met(self):
+        config = PipelineConfig()
+        df_tasks = self._tasks([
+            {"任務ID": "T1", "案家ID": "C1", "日期": "2026-08-17", "時間窗_開始": "09:00", "時間窗_結束": "10:00", "服務歷時(分鐘)": 60},
+            {"任務ID": "T2", "案家ID": "C2", "日期": "2026-08-17", "時間窗_開始": "10:05", "時間窗_結束": "11:00", "服務歷時(分鐘)": 55},
+        ])
+        df_result = pd.DataFrame([{"任務ID": "T1", "派單居服員": "CG1"}])
+        df_cg = pd.DataFrame([{"居服員ID": "CG1", "每日工時上限(小時)": 8.0}])
+        locations = {"T1": (25.05, 121.55), "T2": (25.05, 121.55)}
+
+        err = check_reassignment_conflict("T2", "CG1", df_tasks, df_result, df_cg, config, task_locations=locations)
+        self.assertIsNotNone(err)
+        self.assertIn("CG1", err)
+
+    def test_conflict_when_daily_hour_cap_exceeded(self):
+        config = PipelineConfig()
+        df_tasks = self._tasks([
+            {"任務ID": "T1", "案家ID": "C1", "日期": "2026-08-17", "時間窗_開始": "08:00", "時間窗_結束": "12:00", "服務歷時(分鐘)": 240},
+            {"任務ID": "T2", "案家ID": "C2", "日期": "2026-08-17", "時間窗_開始": "13:00", "時間窗_結束": "17:00", "服務歷時(分鐘)": 240},
+        ])
+        df_result = pd.DataFrame([{"任務ID": "T1", "派單居服員": "CG1"}])
+        df_cg = pd.DataFrame([{"居服員ID": "CG1", "每日工時上限(小時)": 6.0}])
+
+        err = check_reassignment_conflict("T2", "CG1", df_tasks, df_result, df_cg, config)
+        self.assertIsNotNone(err)
+        self.assertIn("上限", err)
+
+    def test_unknown_caregiver_is_rejected(self):
+        config = PipelineConfig()
+        df_tasks = self._tasks([
+            {"任務ID": "T1", "案家ID": "C1", "日期": "2026-08-17", "時間窗_開始": "09:00", "時間窗_結束": "10:00", "服務歷時(分鐘)": 60},
+        ])
+        df_result = pd.DataFrame(columns=["任務ID", "派單居服員"])
+        df_cg = pd.DataFrame([{"居服員ID": "CG1", "每日工時上限(小時)": 8.0}])
+
+        err = check_reassignment_conflict("T1", "CG_NOT_EXIST", df_tasks, df_result, df_cg, config)
+        self.assertIsNotNone(err)
+
+
+class RankCandidatesByAvailabilityTests(unittest.TestCase):
+    """月曆快速改派下拉選單的「空檔優先排序」（rank_candidates_by_availability）。
+
+    與 check_reassignment_conflict 走同一套 _evaluate_reassignment 判定，這裡只驗證
+    排序／標籤輸出，不重複驗證衝突判定本身的邊界條件（已由 QuickReassignConflictTests 涵蓋）。
+    """
+
+    def test_available_candidates_sorted_before_conflicted_ones(self):
+        config = PipelineConfig()
+        df_tasks = pd.DataFrame([
+            {"任務ID": "T1", "案家ID": "C1", "日期": "2026-08-17", "時間窗_開始": "09:00", "時間窗_結束": "10:00", "服務歷時(分鐘)": 60},
+            {"任務ID": "T2", "案家ID": "C2", "日期": "2026-08-17", "時間窗_開始": "09:15", "時間窗_結束": "10:15", "服務歷時(分鐘)": 60},
+            {"任務ID": "T3", "案家ID": "C3", "日期": "2026-08-17", "時間窗_開始": "13:00", "時間窗_結束": "14:00", "服務歷時(分鐘)": 60},
+        ])
+        df_result = pd.DataFrame([
+            {"任務ID": "T1", "派單居服員": "CG_BUSY"},
+            {"任務ID": "T2", "派單居服員": "CG_FREE"},
+        ])
+        df_cg = pd.DataFrame([
+            {"居服員ID": "CG_BUSY", "每日工時上限(小時)": 8.0},
+            {"居服員ID": "CG_FREE", "每日工時上限(小時)": 8.0},
+        ])
+
+        # T3（13:00-14:00）欲從其他人改派：CG_BUSY 當天已有 T1(09:00-10:00)，與 T3 不重疊 -> 應為可派；
+        # 額外驗證 CG_FREE（T2 09:15-10:15，同樣與 T3 不重疊）也應為可派，兩者皆列在前段。
+        ranked = rank_candidates_by_availability(
+            "T3", ["CG_BUSY", "CG_FREE"], df_tasks, df_result, df_cg, config,
+        )
+        self.assertTrue(all(r["available"] for r in ranked))
+
+    def test_conflicted_candidate_ranked_after_available_one_with_detail(self):
+        config = PipelineConfig()
+        df_tasks = pd.DataFrame([
+            {"任務ID": "T1", "案家ID": "C1", "日期": "2026-08-17", "時間窗_開始": "09:00", "時間窗_結束": "10:00", "服務歷時(分鐘)": 60},
+            {"任務ID": "T2", "案家ID": "C2", "日期": "2026-08-17", "時間窗_開始": "09:10", "時間窗_結束": "10:00", "服務歷時(分鐘)": 50},
+        ])
+        df_result = pd.DataFrame([{"任務ID": "T1", "派單居服員": "CG_BUSY"}])
+        df_cg = pd.DataFrame([
+            {"居服員ID": "CG_BUSY", "每日工時上限(小時)": 8.0},
+            {"居服員ID": "CG_FREE", "每日工時上限(小時)": 8.0},
+        ])
+
+        # 候選順序刻意把會衝突的 CG_BUSY 放在最前面：CG_BUSY 於 09:00-10:00 已有任務，
+        # 與待改派的 T2（09:10-10:00）重疊 -> 應被排到 CG_FREE（無既有任務、必為可派）之後。
+        ranked = rank_candidates_by_availability(
+            "T2", ["CG_BUSY", "CG_FREE"], df_tasks, df_result, df_cg, config,
+        )
+        self.assertEqual([r["cg_id"] for r in ranked], ["CG_FREE", "CG_BUSY"])
+        self.assertTrue(ranked[0]["available"])
+        self.assertFalse(ranked[1]["available"])
+        self.assertEqual(ranked[1]["reason"], "time_conflict")
+        self.assertEqual(ranked[1]["conflict_task_id"], "T1")
+        self.assertEqual(ranked[1]["conflict_start"], "09:00")
+        self.assertEqual(ranked[1]["conflict_end"], "10:00")
+
+    def test_check_reassignment_conflict_agrees_with_ranking(self):
+        """單一事實來源：排序結果的 available 判定須與 check_reassignment_conflict 一致。"""
+        config = PipelineConfig()
+        df_tasks = pd.DataFrame([
+            {"任務ID": "T1", "案家ID": "C1", "日期": "2026-08-17", "時間窗_開始": "09:00", "時間窗_結束": "10:00", "服務歷時(分鐘)": 60},
+            {"任務ID": "T2", "案家ID": "C2", "日期": "2026-08-17", "時間窗_開始": "09:10", "時間窗_結束": "10:00", "服務歷時(分鐘)": 50},
+        ])
+        df_result = pd.DataFrame([{"任務ID": "T1", "派單居服員": "CG_BUSY"}])
+        df_cg = pd.DataFrame([{"居服員ID": "CG_BUSY", "每日工時上限(小時)": 8.0}])
+
+        ranked = rank_candidates_by_availability("T2", ["CG_BUSY"], df_tasks, df_result, df_cg, config)
+        err = check_reassignment_conflict("T2", "CG_BUSY", df_tasks, df_result, df_cg, config)
+
+        self.assertFalse(ranked[0]["available"])
+        self.assertIsNotNone(err)
+        self.assertEqual(ranked[0]["detail"], err)
+
+
+class HardConstraintLabelingTests(unittest.TestCase):
+    """回歸測試：月曆快速改派下拉選單過去只從 Phase 1 候選配對（df_matches）取人，
+
+    導致性別不符／缺乏證照／環境排斥等「硬性條件不符」的居服員直接從選單消失，
+    而非保留＋標記。修正後改由呼叫端傳入機構全體居服員 + df_cl，
+    rank_candidates_by_availability 會用與 Phase 1 相同的 _check_hard_constraints
+    標記（而非隱藏）這些人；check_reassignment_conflict（確認改派時的權威判定）
+    則刻意不受影響，因為本系統無強制派單權限機制，居督仍可自行覆寫。
+    """
+
+    def _tasks(self, rows):
+        return pd.DataFrame(rows)
+
+    def _setup(self):
+        config = PipelineConfig()
+        df_tasks = self._tasks([
+            {"任務ID": "T1", "案家ID": "C1", "日期": "2026-08-17", "時間窗_開始": "09:00", "時間窗_結束": "10:00", "服務歷時(分鐘)": 60},
+        ])
+        df_cl = pd.DataFrame([{
+            "案家ID": "C1",
+            "指定居服員性別": "限女性",
+            "需重度移位協助(0/1)": 0,
+            "案家環境特徵": "無",
+            "特殊照護需求": "一般家務與照顧",
+            "歷史首選居服員ID": "",
+        }])
+        df_cg = pd.DataFrame([
+            make_caregiver("CG_MALE", gender="男"),
+            make_caregiver("CG_FEMALE", gender="女"),
+        ])
+        df_result = pd.DataFrame(columns=["任務ID", "派單居服員"])
+        return config, df_tasks, df_cl, df_cg, df_result
+
+    def test_hard_constraint_failure_is_labeled_not_hidden_when_df_cl_provided(self):
+        config, df_tasks, df_cl, df_cg, df_result = self._setup()
+
+        ranked = rank_candidates_by_availability(
+            "T1", ["CG_MALE", "CG_FEMALE"], df_tasks, df_result, df_cg, config, df_cl=df_cl,
+        )
+
+        self.assertEqual({r["cg_id"] for r in ranked}, {"CG_MALE", "CG_FEMALE"})
+        by_id = {r["cg_id"]: r for r in ranked}
+        self.assertTrue(by_id["CG_FEMALE"]["available"])
+        self.assertFalse(by_id["CG_MALE"]["available"])
+        self.assertEqual(by_id["CG_MALE"]["reason"], "hard_constraint")
+        self.assertIn("性別不符", by_id["CG_MALE"]["detail"])
+        # 可派者排在前面。
+        self.assertEqual(ranked[0]["cg_id"], "CG_FEMALE")
+
+    def test_hard_constraint_check_is_opt_in_via_df_cl(self):
+        """未傳 df_cl 時完全跳過硬性條件檢查，維持修正前的行為（僅檢查時間衝突／工時）。"""
+        config, df_tasks, df_cl, df_cg, df_result = self._setup()
+
+        ranked = rank_candidates_by_availability(
+            "T1", ["CG_MALE", "CG_FEMALE"], df_tasks, df_result, df_cg, config,
+        )
+        self.assertTrue(all(r["available"] for r in ranked))
+
+    def test_check_reassignment_conflict_does_not_enforce_hard_constraints(self):
+        """確認改派的權威判定（check_reassignment_conflict）刻意不檢查硬性資格條件，
+
+        只標記在下拉選單供居督參考；本系統沒有強制派單權限機制，居督仍可能因臨時
+        狀況刻意指派不符合建議條件的居服員。
+        """
+        config, df_tasks, df_cl, df_cg, df_result = self._setup()
+
+        err = check_reassignment_conflict("T1", "CG_MALE", df_tasks, df_result, df_cg, config)
+        self.assertIsNone(err)
 
 
 if __name__ == "__main__":

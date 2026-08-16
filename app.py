@@ -28,12 +28,14 @@ import seaborn as sns
 import streamlit as st
 from ortools.linear_solver import pywraplp
 
-from calendar_view import render_calendar_overview
+from calendar_view import apply_overrides_to_result, render_calendar_overview
 from caregiver_engine import (
     DEFAULT_EXCEL_PATH,
     PipelineConfig,
+    check_reassignment_conflict,
     get_weekday_name,
     load_override_log,
+    rank_candidates_by_availability,
     run_monthly_batch_dispatch,
     run_phase1_matching,
     run_phase2_optimization,
@@ -380,6 +382,7 @@ if st.button("🚀 執行 AI 最佳化派單", type="primary"):
     st.session_state["last_result"] = {
         "df_tasks": df_tasks,
         "df_cg": df_cg,
+        "df_cl": df_cl,
         "df_matches": df_matches,
         "phase2": phase2,
         "did": did,
@@ -399,6 +402,66 @@ if "last_result" in st.session_state:
     df_result = phase2["df_result"]
     assigned_count = phase2["assigned_count"]
     solver_ok = phase2["status"] == pywraplp.Solver.OPTIMAL
+
+    # overrides／assigned_map 提前到此處初始化（原僅存在於④區塊），因為月曆視角
+    # 「一鍵調班」與④區塊「居督人工覆寫」共用同一份 overrides 狀態與同一套
+    # save_override_log 稽核紀錄，月曆總覽（KPI 之後即會渲染）需要在此之前就能
+    # 讀寫這份狀態，兩處才不會各自維護一份互不同步的覆寫紀錄。
+    st.session_state.setdefault("overrides", {})
+    overrides = st.session_state["overrides"]
+    assigned_map = dict(zip(df_result["任務ID"], df_result["派單居服員"])) if not df_result.empty else {}
+    task_locations = (
+        df_matches.drop_duplicates("任務ID").set_index("任務ID")[["地點緯度", "地點經度"]].apply(tuple, axis=1).to_dict()
+        if not df_matches.empty
+        else {}
+    )
+
+    def _quick_reassign(task_id, new_cg_id):
+        """月曆視角快速改派／指派：即時衝突檢查通過後，寫入與④區塊共用的 overrides
+        狀態與稽核日誌；回傳 None 表示成功，否則回傳供 Modal 顯示的錯誤訊息。
+
+        同時供「居服員 x 日期」改派 Modal（_quick_reassign_dialog）與「未派單案件」
+        快速指派 Modal（_unassigned_task_dialog）共用：兩者差異只在 task_id 原本是否
+        已有指派，apply_overrides_to_result 本就支援替未指派任務新增覆寫列，
+        不需要另外實作一套指派邏輯。
+        """
+        df_result_effective = apply_overrides_to_result(df_result, overrides)
+        conflict_msg = check_reassignment_conflict(
+            task_id, new_cg_id, df_tasks, df_result_effective, res.get("df_cg", pd.DataFrame()),
+            config, task_locations=task_locations, date_column="日期",
+        )
+        if conflict_msg:
+            return conflict_msg
+
+        task_rows = df_tasks[df_tasks["任務ID"] == task_id]
+        cl_id = task_rows.iloc[0]["案家ID"] if not task_rows.empty else ""
+        ai_cg = assigned_map.get(task_id)
+        ai_label = str(ai_cg) if ai_cg is not None else "未指派"
+        reason_label = "月曆快速改派" if ai_cg is not None else "月曆未派單快速指派"
+        save_override_log(task_id, cl_id, ai_label, new_cg_id, reason_label)
+        overrides[task_id] = {"cg_id": new_cg_id, "reason": reason_label}
+        return None
+
+    def _list_candidates(task_id, candidate_cg_ids):
+        """供月曆快速改派下拉選單使用：把候選居服員依「該時段是否有空檔」排序＋標籤。
+
+        與 _quick_reassign 共用同一套 caregiver_engine.rank_candidates_by_availability／
+        check_reassignment_conflict 判定邏輯（同源於 _evaluate_reassignment），確保
+        選單顯示「可派單」的候選人在按下確認改派時不會被判定衝突而拒絕。
+
+        另外傳入 df_cl，讓排序結果一併標記 Phase 1 硬性資格條件（性別、重度移位、
+        環境排斥、可排班星期、可服務時段、請假、專長認證）不符者，而不是讓這些人
+        因為候選名單只取全體居服員（見 calendar_view._quick_reassign_dialog）而
+        「看似可派但其實從未檢查資格」——這裡刻意不影響 _quick_reassign 的
+        check_reassignment_conflict（未傳 df_cl，維持原本只擋時間衝突／工時超額的
+        權威判定範圍），因為本系統無強制派單權限機制，居督看到標記後仍可自行覆寫。
+        """
+        df_result_effective = apply_overrides_to_result(df_result, overrides)
+        return rank_candidates_by_availability(
+            task_id, candidate_cg_ids, df_tasks, df_result_effective, res.get("df_cg", pd.DataFrame()),
+            config, task_locations=task_locations, date_column="日期",
+            df_cl=res.get("df_cl", pd.DataFrame()),
+        )
 
     if not solver_ok:
         if schedule_failed_dates:
@@ -434,10 +497,15 @@ if "last_result" in st.session_state:
         help=f"申報點數 × 側邊欄設定的拆帳比例（目前 {salary_rate_pct}%）加總。",
     )
 
-    # 月曆班表總覽：純前端彙總既有派單結果與居服員資料表，不重呼叫任何排班演算法
-    # （見 calendar_view.py）；作為整個結果區的「首頁總覽」，置於 KPI 之後、
-    # 派單分析儀表板之前。
-    render_calendar_overview(df_result, df_tasks, res.get("df_cg", pd.DataFrame()))
+    # 月曆班表總覽：彙總既有派單結果與居服員資料表（並套用 overrides 顯示目前實際
+    # 生效班表），不重呼叫任何排班演算法（見 calendar_view.py）；作為整個結果區的
+    # 「首頁總覽」，置於 KPI 之後、派單分析儀表板之前。overrides／on_reassign／
+    # on_list_candidates 供「月曆視角一鍵調班」（含空檔優先排序）使用。
+    render_calendar_overview(
+        df_result, df_tasks, res.get("df_cg", pd.DataFrame()),
+        overrides=overrides,
+        on_reassign=_quick_reassign, on_list_candidates=_list_candidates,
+    )
 
     st.subheader("📊 派單分析儀表板")
     if df_matches.empty:
@@ -536,8 +604,7 @@ if "last_result" in st.session_state:
         "居督可於此針對個別任務手動重新指定居服員；每一筆變更皆會記錄原因並寫入稽核日誌，供後續演算法迭代分析。"
     )
 
-    st.session_state.setdefault("overrides", {})
-    overrides = st.session_state["overrides"]
+    # overrides 已於本區塊之前（月曆總覽渲染前）初始化，此處沿用同一份 session_state。
 
     OVERRIDE_KEEP_AI = "（維持 AI 建議）"
     OVERRIDE_UNASSIGN = "撤銷指派（不指派）"
@@ -558,7 +625,7 @@ if "last_result" in st.session_state:
     cg_id_options = (
         sorted(df_cg_run["居服員ID"].astype(str).unique().tolist()) if not df_cg_run.empty else []
     )
-    assigned_map = dict(zip(df_result["任務ID"], df_result["派單居服員"])) if not df_result.empty else {}
+    # assigned_map 已於本區塊之前初始化並供月曆快速改派共用，此處沿用同一份。
 
     for _, task_row in df_tasks.iterrows():
         t_id = task_row["任務ID"]
