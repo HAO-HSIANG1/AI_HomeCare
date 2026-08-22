@@ -682,6 +682,219 @@ def _diagnose_caregiver_change(
     return f"{subject}雖符合派單資格，惟系統整體最佳化後綜合適配分數較低，已改派其他居服員"
 
 
+def _evaluate_reassignment(
+    task_id,
+    new_cg_id,
+    df_tasks: pd.DataFrame,
+    df_result_effective: pd.DataFrame,
+    df_cg: pd.DataFrame,
+    config: "PipelineConfig",
+    task_locations: Optional[dict] = None,
+    date_column: str = "日期",
+    df_cl: Optional[pd.DataFrame] = None,
+) -> dict:
+    """評估把 task_id 改派給 new_cg_id 是否可行，回傳結構化結果供兩種呼叫端共用：
+
+    - `check_reassignment_conflict`：改派當下的最終權威判定（僅需 available/detail）。
+    - `rank_candidates_by_availability`：改派下拉選單的候選人清單排序與標籤
+      （需要衝突任務的時段細節，才能顯示如「14:00-15:00 服務中」的具體標籤）。
+
+    單一事實來源：兩種呼叫端看到的「是否可派」結論恆一致，不會有選單顯示可派、
+    實際確認卻被拒絕的落差。
+
+    回傳 dict 固定包含 "cg_id"、"available"、"reason"
+    （None｜"task_not_found"｜"caregiver_not_found"｜"bad_time_format"｜
+    "hard_constraint"｜"time_conflict"｜"hour_cap"）、"detail"（完整說明文字）；
+    reason 為 "time_conflict" 時另附 "conflict_task_id"／"conflict_start"／"conflict_end"。
+
+    `df_cl`（Client_Profiles）為選填：提供時會額外以 Phase 1 同一套
+    `_check_hard_constraints`（性別限定、重度移位體力、環境排斥、可排班星期、
+    每日可服務時段、請假日期、專長認證）評估 new_cg_id 是否符合本任務的硬性
+    資格條件，失敗回傳 reason="hard_constraint" 並附上具體原因（例如「當日已有
+    請假或不排班記錄」「缺乏該需求類別之法定專長認證」）——這只影響下拉選單的
+    排序與標籤（見 rank_candidates_by_availability），刻意不接在
+    check_reassignment_conflict 的權威判定路徑上：本系統沒有「強制派單權限」機制，
+    居督仍可能因臨時狀況刻意指派不符合建議條件的居服員，故只標記不隱藏、不封鎖。
+    不提供 df_cl（預設 None）時完全跳過此檢查，行為與加入前相同。
+    """
+    result = {
+        "cg_id": new_cg_id,
+        "available": False,
+        "reason": None,
+        "detail": "",
+        "conflict_task_id": None,
+        "conflict_start": None,
+        "conflict_end": None,
+    }
+
+    task_rows = df_tasks[df_tasks["任務ID"] == task_id]
+    if task_rows.empty:
+        result.update(reason="task_not_found", detail="找不到該任務資料，無法檢查衝突")
+        return result
+    task_row = task_rows.iloc[0]
+
+    cg_rows = df_cg[df_cg["居服員ID"].astype(str) == str(new_cg_id)]
+    if cg_rows.empty:
+        result.update(reason="caregiver_not_found", detail=f"找不到居服員 {new_cg_id} 的資料")
+        return result
+    cg_row = cg_rows.iloc[0]
+
+    task_locations = task_locations or {}
+
+    if df_cl is not None and not df_cl.empty and "案家ID" in task_row.index:
+        cl_rows = df_cl[df_cl["案家ID"].astype(str) == str(task_row["案家ID"])]
+        if not cl_rows.empty:
+            merged_task = pd.Series({**cl_rows.iloc[0].to_dict(), **task_row.to_dict()})
+            travel_time_min = None
+            t_loc = task_locations.get(task_id)
+            cg_home_lat = cg_row.get("服務起點_緯度(家)")
+            cg_home_lon = cg_row.get("服務起點_經度(家)")
+            if t_loc and pd.notna(cg_home_lat) and pd.notna(cg_home_lon) and all(pd.notna(v) for v in t_loc):
+                travel_time_min = calc_travel_minutes(cg_home_lat, cg_home_lon, t_loc[0], t_loc[1], config)
+            is_preferred = str(merged_task.get("歷史首選居服員ID", "")) == str(new_cg_id)
+            hard_reason = _check_hard_constraints(merged_task, cg_row, config, travel_time_min, is_preferred)
+            if hard_reason is not None:
+                result.update(reason="hard_constraint", detail=hard_reason)
+                return result
+
+    t_start, t_end = parse_time(f"{task_row['時間窗_開始']}-{task_row['時間窗_結束']}")
+    if t_start is None:
+        result.update(reason="bad_time_format", detail="任務時間格式無法解析，無法檢查衝突")
+        return result
+
+    if date_column in df_tasks.columns and pd.notna(task_row.get(date_column)):
+        task_date = task_row[date_column]
+        same_day_ids = set(df_tasks.loc[df_tasks[date_column] == task_date, "任務ID"])
+    else:
+        same_day_ids = set(df_tasks["任務ID"])  # 單日排程：所有任務視為同一天
+
+    other_assigned = (
+        df_result_effective[
+            (df_result_effective["派單居服員"].astype(str) == str(new_cg_id))
+            & (df_result_effective["任務ID"].isin(same_day_ids))
+            & (df_result_effective["任務ID"] != task_id)
+        ]
+        if not df_result_effective.empty
+        else df_result_effective
+    )
+
+    total_minutes = float(task_row["服務歷時(分鐘)"])
+
+    if other_assigned is not None:
+        for other_t_id in other_assigned["任務ID"]:
+            other_rows = df_tasks[df_tasks["任務ID"] == other_t_id]
+            if other_rows.empty:
+                continue
+            other_row = other_rows.iloc[0]
+            o_start, o_end = parse_time(f"{other_row['時間窗_開始']}-{other_row['時間窗_結束']}")
+            if o_start is None:
+                continue
+
+            travel_mins = config.buffer_mins
+            t_loc = task_locations.get(task_id)
+            o_loc = task_locations.get(other_t_id)
+            if t_loc and o_loc and all(pd.notna(v) for v in (*t_loc, *o_loc)):
+                travel_mins += calc_travel_minutes(t_loc[0], t_loc[1], o_loc[0], o_loc[1], config)
+
+            if not (
+                t_end + timedelta(minutes=travel_mins) <= o_start
+                or o_end + timedelta(minutes=travel_mins) <= t_start
+            ):
+                result.update(
+                    reason="time_conflict",
+                    conflict_task_id=other_t_id,
+                    conflict_start=str(other_row["時間窗_開始"]),
+                    conflict_end=str(other_row["時間窗_結束"]),
+                    detail=(
+                        f"與居服員 {new_cg_id} 當日另一任務（{other_t_id}，"
+                        f"{other_row['時間窗_開始']}-{other_row['時間窗_結束']}）時間衝突"
+                        f"（含轉場緩衝約 {travel_mins:.0f} 分鐘）"
+                    ),
+                )
+                return result
+            total_minutes += float(other_row["服務歷時(分鐘)"])
+
+    daily_cap = cg_row.get("每日工時上限(小時)")
+    if pd.notna(daily_cap) and total_minutes / 60.0 > daily_cap:
+        result.update(
+            reason="hour_cap",
+            detail=(
+                f"居服員 {new_cg_id} 改派後當日總工時將達 {total_minutes / 60.0:.1f} 小時，"
+                f"超過每日上限 {daily_cap:.1f} 小時"
+            ),
+        )
+        return result
+
+    result["available"] = True
+    return result
+
+
+def check_reassignment_conflict(
+    task_id,
+    new_cg_id,
+    df_tasks: pd.DataFrame,
+    df_result_effective: pd.DataFrame,
+    df_cg: pd.DataFrame,
+    config: "PipelineConfig",
+    task_locations: Optional[dict] = None,
+    date_column: str = "日期",
+) -> Optional[str]:
+    """檢查「快速改派」把 task_id 轉給 new_cg_id 是否會造成時間衝突或工時超標。
+
+    供月曆視角一鍵調班（calendar_view.py）使用：`df_result_effective` 須為已套用
+    居督覆寫後的『目前生效』派單結果（見 apply_overrides_to_result），確保衝突
+    檢查基準與畫面顯示一致，不會用「AI 原始建議」誤判已被覆寫過的任務。
+
+    衝突判定與 Phase 2 限制條件 2（同一居服員新任務時間不得重疊，須預留
+    config.buffer_mins 轉場緩衝）採同一公式，僅多檢查每日工時上限。
+    `task_locations`（任務ID -> (緯度, 經度)，通常取自 df_matches）用於估算轉場
+    車程；缺少座標時保守僅以 config.buffer_mins 判斷重疊，不會略過檢查。
+
+    回傳 None 表示可安全改派；否則回傳供 UI 顯示的錯誤說明文字。
+    """
+    result = _evaluate_reassignment(
+        task_id, new_cg_id, df_tasks, df_result_effective, df_cg, config, task_locations, date_column
+    )
+    return None if result["available"] else result["detail"]
+
+
+def rank_candidates_by_availability(
+    task_id,
+    candidate_cg_ids,
+    df_tasks: pd.DataFrame,
+    df_result_effective: pd.DataFrame,
+    df_cg: pd.DataFrame,
+    config: "PipelineConfig",
+    task_locations: Optional[dict] = None,
+    date_column: str = "日期",
+    df_cl: Optional[pd.DataFrame] = None,
+) -> list:
+    """供月曆快速改派下拉選單使用：把候選居服員依「該時段是否有空檔」排序。
+
+    對 candidate_cg_ids 逐一呼叫 `_evaluate_reassignment`（與確認改派時
+    check_reassignment_conflict 走同一套判定，避免選單顯示可派、實際確認卻被
+    拒絕的落差），回傳依 available 由高到低排序（同組內維持 candidate_cg_ids
+    原始順序）的 dict list，每筆結構同 `_evaluate_reassignment` 的回傳值。
+
+    candidate_cg_ids 預期為「機構內全體居服員」（呼叫端不應預先用 Phase 1
+    的硬性條件篩過一輪才傳進來，否則不符合資格的人會直接從清單消失，而非
+    保留＋標記）；提供 `df_cl` 時，本函式會連同 Phase 1 的硬性資格條件
+    （性別限定、重度移位體力、環境排斥、可排班星期、可服務時段、請假日期、
+    專長認證）一併標記為 reason="hard_constraint"，而非讓呼叫端事先濾掉。
+    刻意不將此檢查接上 check_reassignment_conflict（該函式呼叫
+    _evaluate_reassignment 時不傳 df_cl）：本系統無強制派單權限機制，居督仍可
+    在清楚看到標記後選擇覆寫，故硬性資格條件在此僅供標籤顯示，不封鎖改派。
+    """
+    evaluated = [
+        _evaluate_reassignment(
+            task_id, cg_id, df_tasks, df_result_effective, df_cg, config,
+            task_locations, date_column, df_cl,
+        )
+        for cg_id in candidate_cg_ids
+    ]
+    return sorted(evaluated, key=lambda r: not r["available"])
+
+
 def _build_cg_busy_blocks(df_cg: pd.DataFrame) -> dict:
     """建立居服員今日既定行程時間阻擋塊 (Time Blocks)，回傳 cg_id -> [(start, end, lat, lon), ...]。
 
