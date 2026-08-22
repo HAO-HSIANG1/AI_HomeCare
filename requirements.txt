@@ -4,5 +4,4 @@ openpyxl
 ortools
 requests
 streamlit
-matplotlib
-seaborn
+plotly

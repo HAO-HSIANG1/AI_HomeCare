@@ -19,14 +19,11 @@
 實作演算法。
 """
 
-import pathlib
-
-import matplotlib.font_manager as fm
-import matplotlib.pyplot as plt
 import pandas as pd
-import seaborn as sns
+import plotly.graph_objects as go
 import streamlit as st
 from ortools.linear_solver import pywraplp
+from plotly.subplots import make_subplots
 
 from calendar_view import apply_overrides_to_result, render_calendar_overview, render_task_override_picker
 from caregiver_engine import (
@@ -43,39 +40,6 @@ from caregiver_engine import (
     save_override_log,
     validate_ba_codes,
 )
-
-# ==========================================
-# 跨平台中文字型處理（避免 st.pyplot 圖表出現亂碼）
-# ==========================================
-# 直接隨 repo 附帶一份開源中文字型（Noto Sans TC, SIL Open Font License），
-# 因為系統套件（packages.txt: fonts-noto-cjk）是否真的裝進 Streamlit Cloud 容器、
-# 以及字型註冊名稱是否符合猜測，皆不受我們控制；自帶字型檔可確保任何部署環境
-# 都一定找得到，不必依賴系統/雲端環境是否裝好中文字型。
-_BUNDLED_FONT_PATH = pathlib.Path(__file__).parent / "assets" / "fonts" / "NotoSansTC-Regular.ttf"
-
-
-def setup_chinese_font():
-    # 依平台猜測系統字型名稱不可靠：猜錯字型 matplotlib 不會報錯，只會靜默退回
-    # DejaVu Sans（無中文字形，顯示為方框）。優先使用自帶字型，系統字型僅作備援。
-    bundled_name = None
-    if _BUNDLED_FONT_PATH.exists():
-        fm.fontManager.addfont(str(_BUNDLED_FONT_PATH))
-        bundled_name = fm.FontProperties(fname=str(_BUNDLED_FONT_PATH)).get_name()
-
-    candidates = [
-        "Microsoft JhengHei", "Microsoft YaHei", "SimHei",  # Windows
-        "PingFang TC", "PingFang SC", "Heiti TC", "Arial Unicode MS",  # macOS
-        "Noto Sans CJK TC", "Noto Sans CJK SC", "Noto Sans TC",  # Linux / Streamlit Cloud
-        "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",
-    ]
-    available = {f.name for f in fm.fontManager.ttflist}
-    found = [name for name in candidates if name in available]
-
-    ordered = ([bundled_name] if bundled_name else []) + found + ["DejaVu Sans"]
-    seen = set()
-    plt.rcParams["font.sans-serif"] = [n for n in ordered if not (n in seen or seen.add(n))]
-    plt.rcParams["axes.unicode_minus"] = False
-
 
 # ==========================================
 # 色彩定義（來源：dataviz 色票，固定順序、非隨機挑色）
@@ -109,6 +73,132 @@ REQUIRED_COLUMNS = {
 REQUIRED_TASKS_COLUMNS = ["任務ID", "案家ID", "時間窗_開始", "時間窗_結束", "服務歷時(分鐘)", "任務優先級"]
 
 st.set_page_config(page_title="長照居家照顧 AI 派單系統", page_icon="🏠", layout="wide")
+
+# ==========================================
+# 全域視覺樣式（卡片化 KPI、章節橫幅）
+# ==========================================
+# 只加樣式、不改版面結構：KPI 卡片用半透明疊色（而非依賴 Streamlit 主題 CSS
+# 變數），在淺色／深色主題下都不會因背景色對比不足而讀不清楚。
+st.markdown(
+    f"""
+    <style>
+    [data-testid="stMetric"] {{
+        background: rgba(127, 127, 127, 0.07);
+        border: 1px solid rgba(127, 127, 127, 0.18);
+        border-radius: 14px;
+        padding: 0.9rem 1.1rem 0.7rem 1.1rem;
+        position: relative;
+        overflow: hidden;
+    }}
+    [data-testid="stMetric"]::before {{
+        content: "";
+        position: absolute;
+        top: 0; left: 0; right: 0;
+        height: 4px;
+        background: {BLUE};
+    }}
+    [data-testid="stMetricValue"] {{
+        font-weight: 700;
+    }}
+    .section-banner {{
+        display: flex;
+        align-items: center;
+        gap: 0.6rem;
+        margin: 1.6rem 0 0.15rem 0;
+        padding-bottom: 0.5rem;
+        border-bottom: 2px solid {BLUE};
+    }}
+    .section-banner .section-badge {{
+        flex-shrink: 0;
+        width: 2rem;
+        height: 2rem;
+        border-radius: 50%;
+        background: {BLUE};
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-weight: 700;
+        font-size: 1rem;
+    }}
+    .section-banner .section-title {{
+        font-size: 1.35rem;
+        font-weight: 700;
+    }}
+    .empty-state {{
+        text-align: center;
+        padding: 2.4rem 1rem;
+        margin: 0.5rem 0 1rem 0;
+        border: 1px dashed rgba(127, 127, 127, 0.4);
+        border-radius: 16px;
+        background: rgba(127, 127, 127, 0.04);
+    }}
+    .empty-state .empty-icon {{
+        font-size: 2.2rem;
+        line-height: 1;
+    }}
+    .empty-state .empty-title {{
+        font-size: 1.05rem;
+        font-weight: 700;
+        margin-top: 0.5rem;
+    }}
+    .empty-state .empty-subtitle {{
+        color: rgba(127, 127, 127, 1);
+        margin-top: 0.3rem;
+        font-size: 0.92rem;
+    }}
+    .sheet-summary-card {{
+        background: rgba(127, 127, 127, 0.06);
+        border: 1px solid rgba(127, 127, 127, 0.16);
+        border-radius: 12px;
+        padding: 0.6rem 1rem;
+        margin-bottom: 0.6rem;
+        font-size: 0.9rem;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.4rem 1.6rem;
+    }}
+    .sheet-summary-card b {{
+        color: {BLUE};
+    }}
+    .sheet-summary-card .alert {{
+        color: {ORANGE};
+        font-weight: 600;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def section_banner(number: str, title: str):
+    """章節橫幅：取代 st.header，統一①②③④區塊的視覺樣式（圓形編號徽章＋底線）。"""
+    st.markdown(
+        f"""
+        <div class="section-banner">
+            <span class="section-badge">{number}</span>
+            <span class="section-title">{title}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def empty_state(icon: str, title: str, subtitle: str = ""):
+    """統一的「尚無資料／結果」空狀態樣式，取代裸露的 st.info。"""
+    subtitle_html = f'<div class="empty-subtitle">{subtitle}</div>' if subtitle else ""
+    st.markdown(
+        f"""
+        <div class="empty-state">
+            <div class="empty-icon">{icon}</div>
+            <div class="empty-title">{title}</div>
+            {subtitle_html}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 st.title("🏠 長照居家照顧 AI 派單系統")
 st.caption("居督與營運團隊可上傳／編輯排班資料、調整派單政策參數，並一鍵執行 AI 最佳化派單")
 
@@ -235,7 +325,7 @@ if st.session_state.get("_data_source_key") != source_key:
 # ==========================================
 # 區塊①：Phase 0 申報法規防呆健檢
 # ==========================================
-st.header("① Phase 0：申報法規防呆健檢")
+section_banner("①", "Phase 0：申報法規防呆健檢")
 st.caption(
     "依目前編輯中的任務與案家資料，即時檢核 BA 服務代碼併報合規性（依長照給付支付基準併報規則）。"
     "本健檢僅檢核與提示、不會排除任何任務，亦不影響下方③區塊的派單運算。"
@@ -252,7 +342,11 @@ try:
     h1, h2, h3 = st.columns(3)
     h1.metric("總任務數", f"{_total_tasks_preview}")
     h2.metric("合格任務數", f"{_qualified_count}")
-    h3.metric("⚠️ 偵測到違規申報數", f"{_violation_count}")
+    h3.metric(
+        "⚠️ 偵測到違規申報數", f"{_violation_count}",
+        delta="需複核" if _violation_count > 0 else "正常",
+        delta_color="inverse" if _violation_count > 0 else "off",
+    )
 
     if _violation_count > 0:
         st.warning(
@@ -272,7 +366,7 @@ except Exception as e:
 # ==========================================
 # 區塊②：Excel 載入與現況檢視／動態編輯
 # ==========================================
-st.header("② 資料載入與編輯")
+section_banner("②", "資料載入與編輯")
 
 
 def render_editable_sheet(session_key: str):
@@ -301,6 +395,15 @@ def render_editable_sheet(session_key: str):
     st.session_state[session_key] = edited
 
 
+def render_sheet_summary(items: list[tuple[str, str, bool]]):
+    """分頁摘要卡：不展開表格也能一眼掌握資料健康度（列數、需留意項目等）。"""
+    parts = [
+        f'<span><b>{label}</b>：<span class="{"alert" if alert else ""}">{value}</span></span>'
+        for label, value, alert in items
+    ]
+    st.markdown(f'<div class="sheet-summary-card">{"".join(parts)}</div>', unsafe_allow_html=True)
+
+
 tab_cg, tab_cl, tab_tasks = st.tabs([
     "居服員資料 (Caregiver_Profiles)",
     "案家資料 (Client_Profiles)",
@@ -308,21 +411,53 @@ tab_cg, tab_cl, tab_tasks = st.tabs([
 ])
 
 with tab_cg:
+    _df_cg_preview = st.session_state["edit_cg"]
+    _cg_items = [("居服員人數", f"{len(_df_cg_preview)} 人", False)]
+    if "當月累計服務時數(疲勞度)" in _df_cg_preview.columns:
+        _fatigue_high = int(
+            (pd.to_numeric(_df_cg_preview["當月累計服務時數(疲勞度)"], errors="coerce")
+             >= config.fatigue_reference_hours).sum()
+        )
+        _cg_items.append((
+            f"疲勞度偏高（≥{config.fatigue_reference_hours:.0f}小時）", f"{_fatigue_high} 人", _fatigue_high > 0,
+        ))
+    if "具備重度移位體力(0/1)" in _df_cg_preview.columns:
+        _heavy_capable = int(pd.to_numeric(_df_cg_preview["具備重度移位體力(0/1)"], errors="coerce").eq(1).sum())
+        _cg_items.append(("具重度移位體力", f"{_heavy_capable} 人", False))
+    render_sheet_summary(_cg_items)
     st.caption("可直接編輯儲存格、新增／刪除列（勾選列號後按 Delete），或透過「新增欄位」新增自訂欄位。")
     render_editable_sheet("edit_cg")
 
 with tab_cl:
+    _df_cl_preview = st.session_state["edit_cl"]
+    _cl_items = [("案家戶數", f"{len(_df_cl_preview)} 戶", False)]
+    if "需重度移位協助(0/1)" in _df_cl_preview.columns:
+        _heavy_needed = int(pd.to_numeric(_df_cl_preview["需重度移位協助(0/1)"], errors="coerce").eq(1).sum())
+        _cl_items.append(("需重度移位協助", f"{_heavy_needed} 戶", False))
+    if "指定居服員性別" in _df_cl_preview.columns:
+        _gender_req = int(_df_cl_preview["指定居服員性別"].isin(["限女性", "限男性"]).sum())
+        _cl_items.append(("有性別限定", f"{_gender_req} 戶", False))
+    render_sheet_summary(_cl_items)
     st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
     render_editable_sheet("edit_cl")
 
 with tab_tasks:
+    _df_tasks_preview = st.session_state["edit_tasks"]
+    _tasks_items = [("任務筆數", f"{len(_df_tasks_preview)} 筆", False)]
+    if "任務優先級" in _df_tasks_preview.columns:
+        _urgent_count = int(_df_tasks_preview["任務優先級"].astype(str).str.contains("緊急", na=False).sum())
+        _tasks_items.append(("緊急任務", f"{_urgent_count} 筆", False))
+    if "日期" in _df_tasks_preview.columns:
+        _date_span = _df_tasks_preview["日期"].dropna().nunique()
+        _tasks_items.append(("涵蓋日期數", f"{_date_span} 天", False))
+    render_sheet_summary(_tasks_items)
     st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
     render_editable_sheet("edit_tasks")
 
 # ==========================================
 # 區塊③：一鍵執行與成果儀表板
 # ==========================================
-st.header("③ 執行最佳化派單與成果儀表板")
+section_banner("③", "執行最佳化派單與成果儀表板")
 
 _tasks_preview_df = st.session_state["edit_tasks"]
 has_date_column = "日期" in _tasks_preview_df.columns
@@ -352,32 +487,40 @@ if st.button("🚀 執行 AI 最佳化派單", type="primary"):
     if has_date_column and schedule_mode == "單日排程" and selected_schedule_date is not None:
         df_tasks = df_tasks[df_tasks["日期"] == selected_schedule_date].copy()
 
-    try:
-        tasks = df_tasks.merge(df_cl, on="案家ID", how="left")
-        df_matches = run_phase1_matching(tasks, df_cg, config)
+    with st.status("🚀 AI 派單運算中...", expanded=True) as status:
+        try:
+            status.write("🔍 Phase 1／候選配對評分中（含 OSRM 車程查詢，視資料量可能需要數秒）...")
+            tasks = df_tasks.merge(df_cl, on="案家ID", how="left")
+            df_matches = run_phase1_matching(tasks, df_cg, config)
 
-        if has_date_column and schedule_mode == "全月一鍵排程":
-            batch = run_monthly_batch_dispatch(tasks, df_cg, config, date_column="日期")
-            failed_dates = [
-                d for d, r in batch["daily_results"].items() if r["status"] != pywraplp.Solver.OPTIMAL
-            ]
-            phase2 = {
-                "df_valid": pd.DataFrame(),
-                "status": pywraplp.Solver.OPTIMAL if not failed_dates else None,
-                "df_result": batch["df_result_all"],
-                "assigned_count": batch["total_assigned_count"],
-            }
-        else:
-            phase2 = run_phase2_optimization(df_matches, tasks, df_cg, config)
-            failed_dates = []
+            if has_date_column and schedule_mode == "全月一鍵排程":
+                status.write("🧮 Phase 2／全月批次最佳化求解中（逐日求解後彙整）...")
+                batch = run_monthly_batch_dispatch(tasks, df_cg, config, date_column="日期")
+                failed_dates = [
+                    d for d, r in batch["daily_results"].items() if r["status"] != pywraplp.Solver.OPTIMAL
+                ]
+                phase2 = {
+                    "df_valid": pd.DataFrame(),
+                    "status": pywraplp.Solver.OPTIMAL if not failed_dates else None,
+                    "df_result": batch["df_result_all"],
+                    "assigned_count": batch["total_assigned_count"],
+                }
+            else:
+                status.write("🧮 Phase 2／OR-Tools 最佳化求解中...")
+                phase2 = run_phase2_optimization(df_matches, tasks, df_cg, config)
+                failed_dates = []
 
-        did = run_phase3_did(df_hist)
-    except Exception as e:
-        st.error(
-            "⚠️ 派單運算過程發生錯誤，請確認表格中的 ID 對應是否存在、數值欄位是否填寫正確"
-            f"（例如經緯度、工時、時間格式「HH:MM」）。錯誤訊息：{e}"
-        )
-        st.stop()
+            status.write("📈 Phase 3／AI vs 人工歷史成效回溯分析中...")
+            did = run_phase3_did(df_hist)
+
+            status.update(label="✅ AI 派單運算完成", state="complete", expanded=False)
+        except Exception as e:
+            status.update(label="❌ 派單運算失敗", state="error", expanded=True)
+            st.error(
+                "⚠️ 派單運算過程發生錯誤，請確認表格中的 ID 對應是否存在、數值欄位是否填寫正確"
+                f"（例如經緯度、工時、時間格式「HH:MM」）。錯誤訊息：{e}"
+            )
+            st.stop()
 
     st.session_state["last_result"] = {
         "df_tasks": df_tasks,
@@ -487,8 +630,19 @@ if "last_result" in st.session_state:
     total_salary = df_result["預估居服員拆帳薪資"].sum() if not df_result.empty else 0.0
 
     st.subheader("📌 KPI 指標")
+    if assign_rate >= 90:
+        assign_rate_delta, assign_rate_delta_color = "良好", "normal"
+    elif assign_rate >= 70:
+        assign_rate_delta, assign_rate_delta_color = "普通", "off"
+    else:
+        assign_rate_delta, assign_rate_delta_color = "偏低", "inverse"
+
     k1, k2, k3 = st.columns(3)
-    k1.metric("派單成功率", f"{assign_rate:.1f}%", help=f"{assigned_count} / {total_tasks} 筆任務成功指派")
+    k1.metric(
+        "派單成功率", f"{assign_rate:.1f}%",
+        delta=assign_rate_delta, delta_color=assign_rate_delta_color,
+        help=f"{assigned_count} / {total_tasks} 筆任務成功指派",
+    )
     k2.metric("平均轉場時間", f"{avg_transition:.1f} 分", help="已派單任務的平均車程時間＋轉場緩衝時間")
     k3.metric("平均適配得分", f"{avg_score:.1f} 分", help="已派單配對的平均適配度分數")
 
@@ -514,64 +668,80 @@ if "last_result" in st.session_state:
 
     st.subheader("📊 派單分析儀表板")
     if df_matches.empty:
-        st.info("目前無候選配對可供分析（可能所有配對皆被硬性條件過濾）。")
+        empty_state("🧩", "目前無候選配對可供分析", "可能所有配對皆被硬性條件過濾，請檢查②區塊的居服員／案家資料是否有衝突條件。")
     else:
-        sns.set_style("whitegrid")
-        setup_chinese_font()  # 須在 sns.set_style 之後呼叫，否則字型會被 seaborn 預設值覆蓋
-        fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+        mean_score = df_matches["適配度分數"].mean()
+        unassigned = total_tasks - assigned_count
+
+        fig = make_subplots(
+            rows=2, cols=2,
+            specs=[[{"type": "xy"}, {"type": "xy"}], [{"type": "domain"}, {"type": "xy"}]],
+            subplot_titles=[
+                "適配度分數分布（全部候選配對）",
+                "各居服員派單量",
+                "任務派單狀態占比",
+                f"歷史平均滿意度比較（淨提升 +{did['uplift_sat']:.2f} 分）",
+            ],
+            vertical_spacing=0.14, horizontal_spacing=0.1,
+        )
 
         # (1) 適配度分數分布
-        ax = axes[0, 0]
-        ax.hist(df_matches["適配度分數"], bins=20, color=BLUE, edgecolor="white")
-        mean_score = df_matches["適配度分數"].mean()
-        ax.axvline(mean_score, color=MUTED, linestyle="--", label=f"平均 {mean_score:.1f}")
-        ax.set_title("適配度分數分布（全部候選配對）")
-        ax.set_xlabel("適配度分數")
-        ax.set_ylabel("候選配對數")
-        ax.legend()
+        fig.add_trace(
+            go.Histogram(x=df_matches["適配度分數"], nbinsx=20, marker_color=BLUE, showlegend=False),
+            row=1, col=1,
+        )
+        fig.add_vline(
+            x=mean_score, line_dash="dash", line_color=MUTED,
+            annotation_text=f"平均 {mean_score:.1f}", annotation_position="top",
+            row=1, col=1,
+        )
+        fig.update_xaxes(title_text="適配度分數", row=1, col=1)
+        fig.update_yaxes(title_text="候選配對數", row=1, col=1)
 
         # (2) 各居服員派單量
-        ax = axes[0, 1]
         if not df_result.empty:
             load_counts = df_result["派單居服員"].value_counts().sort_values(ascending=True)
-            ax.barh(load_counts.index.astype(str), load_counts.values, color=BLUE)
-            ax.set_xlabel("派單任務數")
+            fig.add_trace(
+                go.Bar(x=load_counts.values, y=load_counts.index.astype(str), orientation="h",
+                       marker_color=BLUE, showlegend=False),
+                row=1, col=2,
+            )
         else:
-            ax.text(0.5, 0.5, "無派單結果", ha="center", va="center", transform=ax.transAxes)
-        ax.set_title("各居服員派單量")
+            fig.add_trace(
+                go.Bar(x=[0], y=["尚無派單結果"], orientation="h", marker_color=MUTED, showlegend=False),
+                row=1, col=2,
+            )
+        fig.update_xaxes(title_text="派單任務數", row=1, col=2)
 
         # (3) 派單狀態占比
-        ax = axes[1, 0]
-        unassigned = total_tasks - assigned_count
         if total_tasks > 0:
-            ax.pie(
-                [assigned_count, unassigned],
-                labels=["已派單", "未派單"],
-                colors=[BLUE, MUTED],
-                autopct="%1.1f%%",
-                startangle=90,
+            fig.add_trace(
+                go.Pie(
+                    labels=["已派單", "未派單"], values=[assigned_count, unassigned],
+                    marker_colors=[BLUE, MUTED], textinfo="percent+label", showlegend=False,
+                ),
+                row=2, col=1,
             )
-        ax.set_title("任務派單狀態占比")
 
         # (4) AI vs 人工歷史成效比較（DiD）
-        ax = axes[1, 1]
-        ax.bar(
-            ["AI 派單\n(Treatment)", "人工派單\n(Control)"],
-            [did["ai_sat"], did["human_sat"]],
-            color=[BLUE, ORANGE],
+        fig.add_trace(
+            go.Bar(
+                x=["AI 派單(Treatment)", "人工派單(Control)"],
+                y=[did["ai_sat"], did["human_sat"]],
+                marker_color=[BLUE, ORANGE],
+                text=[f"{v:.2f}" for v in [did["ai_sat"], did["human_sat"]]],
+                textposition="outside", showlegend=False,
+            ),
+            row=2, col=2,
         )
-        for i, v in enumerate([did["ai_sat"], did["human_sat"]]):
-            ax.text(i, v, f"{v:.2f}", ha="center", va="bottom")
-        ax.set_ylim(0, 5)
-        ax.set_title(f"歷史平均滿意度比較（淨提升 +{did['uplift_sat']:.2f} 分）")
-        ax.set_ylabel("案家滿意度（1-5分）")
+        fig.update_yaxes(title_text="案家滿意度（1-5分）", range=[0, 5], row=2, col=2)
 
-        fig.tight_layout()
-        st.pyplot(fig)
+        fig.update_layout(height=760, margin=dict(t=60, b=20, l=10, r=10))
+        st.plotly_chart(fig, width="stretch")
 
     st.subheader("📋 指派明細表")
     if df_result.empty:
-        st.info("目前無派單結果。")
+        empty_state("📭", "目前無派單結果")
     else:
         df_display = df_result.copy()
         has_date_for_display = "日期" in df_tasks.columns
@@ -603,7 +773,7 @@ if "last_result" in st.session_state:
     # ==========================================
     # 區塊④：居督人工覆寫（Supervisor Override）與稽核日誌
     # ==========================================
-    st.header("④ 居督人工覆寫（Supervisor Override）")
+    section_banner("④", "居督人工覆寫（Supervisor Override）")
     st.caption(
         "當 AI 建議排單不符合實際場域狀況時（例如居服員臨時請假、案家臨時改期），"
         "居督可搜尋／選擇任務後於彈出視窗手動重新指定居服員（與月曆視角「一鍵調班」"
@@ -684,8 +854,8 @@ if "last_result" in st.session_state:
 
     with st.expander("🗂️ 檢視完整稽核日誌 (supervisor_override_log.csv)"):
         if override_log_df.empty:
-            st.info("尚無居督覆寫紀錄。")
+            empty_state("🗂️", "尚無居督覆寫紀錄")
         else:
             st.dataframe(override_log_df, width="stretch", hide_index=True)
 else:
-    st.info("請先於上方確認／編輯資料，再按下「🚀 執行 AI 最佳化派單」開始運算。")
+    empty_state("🚀", "尚未執行派單", "請先於上方②區塊確認／編輯資料，再按下「🚀 執行 AI 最佳化派單」開始運算。")
