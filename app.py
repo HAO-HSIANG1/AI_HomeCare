@@ -28,7 +28,7 @@ import seaborn as sns
 import streamlit as st
 from ortools.linear_solver import pywraplp
 
-from calendar_view import apply_overrides_to_result, render_calendar_overview
+from calendar_view import apply_overrides_to_result, render_calendar_overview, render_task_override_picker
 from caregiver_engine import (
     DEFAULT_EXCEL_PATH,
     PipelineConfig,
@@ -416,14 +416,15 @@ if "last_result" in st.session_state:
         else {}
     )
 
-    def _quick_reassign(task_id, new_cg_id):
-        """月曆視角快速改派／指派：即時衝突檢查通過後，寫入與④區塊共用的 overrides
-        狀態與稽核日誌；回傳 None 表示成功，否則回傳供 Modal 顯示的錯誤訊息。
+    def _quick_reassign(task_id, new_cg_id, reason):
+        """統一的居督覆寫寫入入口：即時衝突檢查通過後，寫入 overrides 狀態與稽核
+        日誌；回傳 None 表示成功，否則回傳供呼叫端 Modal 顯示的錯誤訊息。
 
-        同時供「居服員 x 日期」改派 Modal（_quick_reassign_dialog）與「未派單案件」
-        快速指派 Modal（_unassigned_task_dialog）共用：兩者差異只在 task_id 原本是否
-        已有指派，apply_overrides_to_result 本就支援替未指派任務新增覆寫列，
-        不需要另外實作一套指派邏輯。
+        供月曆「居服員 x 日期」改派 Modal、月曆「未派單案件」處置，以及④區塊
+        「居督人工覆寫」任務搜尋器共用（calendar_view._task_override_dialog／
+        _quick_reassign_dialog）：三者差異只在 task_id 原本是否已有指派、觸發
+        來源不同，apply_overrides_to_result 本就支援替未指派任務新增覆寫列，
+        不需要另外實作一套指派邏輯；reason 由呼叫端的原因選擇器收集（必填）。
         """
         df_result_effective = apply_overrides_to_result(df_result, overrides)
         conflict_msg = check_reassignment_conflict(
@@ -437,10 +438,14 @@ if "last_result" in st.session_state:
         cl_id = task_rows.iloc[0]["案家ID"] if not task_rows.empty else ""
         ai_cg = assigned_map.get(task_id)
         ai_label = str(ai_cg) if ai_cg is not None else "未指派"
-        reason_label = "月曆快速改派" if ai_cg is not None else "月曆未派單快速指派"
-        save_override_log(task_id, cl_id, ai_label, new_cg_id, reason_label)
-        overrides[task_id] = {"cg_id": new_cg_id, "reason": reason_label}
+        save_override_log(task_id, cl_id, ai_label, new_cg_id if new_cg_id is not None else "未指派", reason)
+        overrides[task_id] = {"cg_id": new_cg_id, "reason": reason}
         return None
+
+    def _clear_override(task_id):
+        """清除單一任務的居督覆寫，還原為 AI 建議；與原④區塊「清除覆寫」行為
+        相同，不寫入稽核日誌（稽核日誌只記錄實際發生過的覆寫變更）。"""
+        overrides.pop(task_id, None)
 
     def _list_candidates(task_id, candidate_cg_ids):
         """供月曆快速改派下拉選單使用：把候選居服員依「該時段是否有空檔」排序＋標籤。
@@ -601,14 +606,12 @@ if "last_result" in st.session_state:
     st.header("④ 居督人工覆寫（Supervisor Override）")
     st.caption(
         "當 AI 建議排單不符合實際場域狀況時（例如居服員臨時請假、案家臨時改期），"
-        "居督可於此針對個別任務手動重新指定居服員；每一筆變更皆會記錄原因並寫入稽核日誌，供後續演算法迭代分析。"
+        "居督可搜尋／選擇任務後於彈出視窗手動重新指定居服員（與月曆視角「一鍵調班」"
+        "共用同一套覆寫互動介面）；每一筆變更皆會記錄原因並寫入稽核日誌，供後續演算法迭代分析。"
     )
 
     # overrides 已於本區塊之前（月曆總覽渲染前）初始化，此處沿用同一份 session_state。
 
-    OVERRIDE_KEEP_AI = "（維持 AI 建議）"
-    OVERRIDE_UNASSIGN = "撤銷指派（不指派）"
-    OVERRIDE_REASONS = ["車程太遠", "居服員請假", "案家臨時改期", "長者情緒抗拒", "其他"]
     OVERRIDE_TRAVEL_ALERT_THRESHOLD = 3
 
     override_log_df = load_override_log()
@@ -621,85 +624,11 @@ if "last_result" in st.session_state:
             "建議提高側邊欄的『車程扣分權重』，讓 AI 派單更優先考量就近指派。"
         )
 
-    df_cg_run = res.get("df_cg", pd.DataFrame())
-    cg_id_options = (
-        sorted(df_cg_run["居服員ID"].astype(str).unique().tolist()) if not df_cg_run.empty else []
-    )
     # assigned_map 已於本區塊之前初始化並供月曆快速改派共用，此處沿用同一份。
-
-    for _, task_row in df_tasks.iterrows():
-        t_id = task_row["任務ID"]
-        cl_id = task_row["案家ID"]
-        ai_cg = assigned_map.get(t_id)
-        ai_label = str(ai_cg) if ai_cg is not None else "未指派"
-
-        existing_override = overrides.get(t_id)
-        current_label = (
-            ("未指派" if existing_override["cg_id"] is None else str(existing_override["cg_id"]))
-            if existing_override
-            else ai_label
-        )
-
-        header = f"任務 {t_id}（案家 {cl_id}）— AI 建議：{ai_label}"
-        if existing_override:
-            header += f"　→　居督已覆寫為：{current_label}（{existing_override['reason']}）"
-
-        with st.expander(header):
-            options = [OVERRIDE_KEEP_AI] + cg_id_options + [OVERRIDE_UNASSIGN]
-            if existing_override:
-                default_val = (
-                    OVERRIDE_UNASSIGN if existing_override["cg_id"] is None else str(existing_override["cg_id"])
-                )
-                default_idx = options.index(default_val) if default_val in options else 0
-            else:
-                default_idx = 0
-
-            chosen = st.selectbox(
-                "居督手動指定居服員",
-                options,
-                index=default_idx,
-                key=f"override_select_{t_id}",
-            )
-
-            if chosen == OVERRIDE_KEEP_AI:
-                new_cg = ai_cg
-            elif chosen == OVERRIDE_UNASSIGN:
-                new_cg = None
-            else:
-                new_cg = chosen
-
-            override_happens = new_cg != ai_cg
-
-            reason = ""
-            if override_happens:
-                reason = st.selectbox(
-                    "換人原因（必填）",
-                    OVERRIDE_REASONS,
-                    key=f"override_reason_{t_id}",
-                )
-                if reason == "其他":
-                    reason = st.text_input("請說明其他原因（必填）", key=f"override_reason_detail_{t_id}")
-
-            col_confirm, col_clear = st.columns(2)
-            if col_confirm.button(
-                "✅ 確認覆寫", key=f"override_confirm_{t_id}", disabled=not override_happens, width="stretch"
-            ):
-                if not reason.strip():
-                    st.warning("請填寫換人原因後再確認。")
-                else:
-                    save_override_log(
-                        t_id, cl_id, ai_label, new_cg if new_cg is not None else "未指派", reason
-                    )
-                    overrides[t_id] = {"cg_id": new_cg, "reason": reason}
-                    st.success("已記錄居督覆寫，並寫入稽核日誌。")
-                    st.rerun()
-
-            if existing_override:
-                if col_clear.button(
-                    "↩️ 清除覆寫，還原 AI 建議", key=f"override_clear_{t_id}", width="stretch"
-                ):
-                    del overrides[t_id]
-                    st.rerun()
+    render_task_override_picker(
+        df_tasks, df_result, res.get("df_cg", pd.DataFrame()), overrides,
+        on_reassign=_quick_reassign, on_clear_override=_clear_override, on_list_candidates=_list_candidates,
+    )
 
     st.subheader("📄 最終派單結果（含居督覆寫）")
     has_date_for_final = "日期" in df_tasks.columns

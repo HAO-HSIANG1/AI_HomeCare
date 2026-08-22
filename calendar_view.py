@@ -7,21 +7,23 @@
 邏輯。僅在任務資料具備「日期」欄位（月批次排班模式）時才顯示；單日排程模式下由
 呼叫端（app.py）略過本區塊。
 
-本模組的「寫入」動作有兩種入口，皆委派給同一個 `on_reassign` callback（app.py 中
+本模組的「寫入」動作有三種入口，皆委派給同一個 `on_reassign` callback（app.py 中
 實作，會呼叫 caregiver_engine.check_reassignment_conflict 與 save_override_log）：
 1. 「月曆視角一鍵調班」：點擊週矩陣中「居服員 x 日期」格位，開啟 Modal 檢視當日
    任務並快速改派給其他居服員（見 _quick_reassign_dialog）。
 2. 「未派單案件快速指派」：點擊月曆格位中的「🚩 N 筆未派單」，於週矩陣下方列出
-   當日未派單任務，逐筆開啟 Modal 顯示全體居服員候選名單與未派原因（見
-   _unassigned_task_dialog）。
+   當日未派單任務，逐筆開啟單一任務覆寫 Modal（見 _task_override_dialog）。
+3. 「④居督人工覆寫」：搜尋／選擇任一任務（不論是否已指派），開啟與上述相同的
+   單一任務覆寫 Modal（見 render_task_override_picker），取代逐筆列出全部任務的
+   舊版清單。
 
-兩者都不直接呼叫任何排班演算法函式，僅呈現 callback 回傳的成功/錯誤結果；
+三者都不直接呼叫任何排班演算法函式，僅呈現 callback 回傳的成功/錯誤結果；
 「原本已指派」與「原本未指派」的任務走同一套覆寫邏輯，因為
 apply_overrides_to_result 本就支援替未指派任務新增覆寫列。
 
 Dialog 開啟狀態統一收斂到單一 session_state 鍵 `calendar_active_dialog`
-（None｜{"kind": "reassign", "cg_id", "date"}｜{"kind": "unassigned", "task_id"}），
-不使用兩個各自獨立的旗標。原因：st.dialog 的原生右上角關閉鈕（× icon）沒有
+（None｜{"kind": "reassign", "cg_id", "date"}｜{"kind": "task", "task_id"}），
+不使用各自獨立的旗標。原因：st.dialog 的原生右上角關閉鈕（× icon）沒有
 on_close callback 可掛勾，居督若透過它關閉而非本模組的自訂「✕ 關閉」按鈕，
 觸發開啟的旗標不會被清除；下次任何 rerun（例如點選月曆上完全無關的日期或
 未派單徽章）只要仍呼叫到同一段「if 旗標為真就開 Dialog」的程式碼，就會讓
@@ -30,6 +32,13 @@ Dialog 意外重新彈出。改用單一鍵有兩個好處：(1) 開啟一種 Di
 「Only one dialog is allowed to be opened at the same time」例外；(2) 「日期」與
 「未派單」徽章的點擊處理常式會明確把這個鍵重設為 None，即使先前有殘留的
 待開啟狀態，點下這兩個按鈕後也保證不會意外彈出任何 Dialog。
+
+kind="task" 的 Dialog 統一由 render_task_override_picker（於 app.py④區塊呼叫，
+每次 rerun 都會執行）集中派送，不論觸發來源是月曆「未派單」按鈕還是④區塊的
+任務搜尋器：因為 st.dialog 是浮動於畫面中央的 Modal，不受呼叫點在腳本中的
+位置影響，集中派送可讓「成功後彈出 Toast 並關閉 Dialog」只需實作一次
+（_task_override_dialog 開頭的 success_key 檢查），不必為「觸發來源不同、
+成功後任務是否還留在候選清單中」個別寫收尾判斷。
 
 點擊「日期」／「未派單」徽章另外會設定 session_state["calendar_scroll_to"]
 （None｜"matrix"｜"unassigned"），驅動頁面平滑捲動到對應錨點（見
@@ -61,6 +70,12 @@ STATUS_LABELS = {
     "danger": "超過工時上限",
     "off": "請假或不可排班",
 }
+
+# 居督覆寫原因分類：月曆快速改派、未派單／單一任務覆寫 Modal 共用同一套分類，
+# 確保無論從哪個入口寫入，稽核日誌（supervisor_override_log.csv）的「變更原因」
+# 欄位格式一致，可直接彙總統計（例如④區塊的「車程太遠」累計筆數警示）。
+OVERRIDE_UNASSIGN = "撤銷指派（不指派）"
+OVERRIDE_REASONS = ["車程太遠", "居服員請假", "案家臨時改期", "長者情緒抗拒", "其他"]
 
 
 def _to_date(value):
@@ -414,7 +429,7 @@ def _render_week_matrix(
                     + (f"　🩺 {service_type}" if service_type else "")
                 )
                 if c2.button("🔍 選擇居服員", key=f"cal_unassigned_open_{t_id}", width="stretch"):
-                    st.session_state["calendar_active_dialog"] = {"kind": "unassigned", "task_id": t_id}
+                    st.session_state["calendar_active_dialog"] = {"kind": "task", "task_id": t_id}
                     st.rerun()
 
     if st.button("✕ 關閉細節", key="calendar_close_detail"):
@@ -422,10 +437,12 @@ def _render_week_matrix(
         st.session_state["calendar_active_dialog"] = None
         st.rerun()
 
-    # 單一 Dialog 分派點：calendar_active_dialog 一次只會是「reassign」或
-    # 「unassigned」其中一種（或 None），兩個 if 不可能同時成立，因此不可能在同一次
-    # rerun 呼叫超過一個 @st.dialog 函式（見模組頂端說明，修正
-    # StreamlitAPIException: Only one dialog is allowed to be opened at the same time）。
+    # 單一 Dialog 分派點（僅處理本函式自己觸發的「reassign」種類）：
+    # kind="task"（未派單／④區塊任務覆寫）改由 render_task_override_picker
+    # 集中派送，見該函式與模組頂端說明；calendar_active_dialog 一次只會是其中
+    # 一種（或 None），從結構上就不可能在同一次 rerun 呼叫超過一個 @st.dialog
+    # 函式（修正 StreamlitAPIException: Only one dialog is allowed to be
+    # opened at the same time）。
     active_dialog = st.session_state.get("calendar_active_dialog")
     if active_dialog and active_dialog.get("kind") == "reassign":
         cell_cg_id = active_dialog.get("cg_id")
@@ -436,39 +453,32 @@ def _render_week_matrix(
                 cell_cg_id, cell_date, df_result, df_tasks, df_cg, date_column,
                 on_reassign, on_list_candidates,
             )
-    elif active_dialog and active_dialog.get("kind") == "unassigned":
-        selected_unassigned_task = active_dialog.get("task_id")
-        if selected_unassigned_task in unassigned_task_ids:
-            _unassigned_task_dialog(
-                selected_unassigned_task, df_tasks, df_cg, df_result, on_reassign, on_list_candidates,
-            )
-        elif st.session_state.pop("calendar_unassigned_assign_success", False):
-            # 指派成功的那次 rerun：on_click callback（_unassigned_assign_click）已
-            # 在腳本重跑「之前」把 overrides 寫入完成，導致這裡重新計算出的
-            # unassigned_task_ids 已經不含 selected_unassigned_task，上面的 if 判斷
-            # 為 False，_unassigned_task_dialog 這個函式本身根本不會被呼叫——它內部
-            # 那段「彈 Toast → 清空 calendar_active_dialog」的收尾程式碼自然也不會
-            # 執行，於是 Dialog 悄悄消失但沒有 Toast，且 calendar_active_dialog
-            # 留下過期指標（與模組頂端說明的「原生關閉鈕」問題同一類：某個旗標
-            # 沒被清除，等到之後任何 rerun 都可能被誤讀）。在此補上與 Dialog 內部
-            # 相同的收尾動作，讓「指派後即從候選集合消失」這條路徑也能顯示 Toast
-            # 並確實清空狀態。
-            detail = st.session_state.pop("calendar_unassigned_assign_success_detail", None)
-            if detail:
-                st.toast(f"✅ 已將任務 {detail[0]} 指派給 {detail[1]}", icon="✅")
-            else:
-                st.toast("✅ 指派成功！", icon="✅")
-            st.session_state["calendar_active_dialog"] = None
-            st.rerun()
-        else:
-            # 非成功指派、任務卻已不在未派清單中：屬於過期狀態（例如資料被其他
-            # 方式更動），同樣直接清空，避免殘留旗標在往後的 rerun 中被誤用。
-            st.session_state["calendar_active_dialog"] = None
+
+
+def _resolve_reason(key_prefix: str) -> str:
+    """從 _reason_picker 寫入的 session_state 讀回目前選定的覆寫原因（在 on_click
+    callback 內呼叫，而非直接沿用渲染當下的區域變數，確保讀到的是使用者最後
+    互動後的最終值，與本檔其餘 callback 讀 sel_key 的既有作法一致）。
+    """
+    reason = st.session_state.get(f"{key_prefix}_reason", "")
+    if reason == "其他":
+        reason = st.session_state.get(f"{key_prefix}_reason_detail", "")
+    return (reason or "").strip()
+
+
+def _reason_picker(key_prefix: str) -> str:
+    """居督覆寫原因選擇器：下拉常見原因＋「其他」搭配自由文字輸入。原④區塊
+    「居督人工覆寫」逐筆列表的原因欄位規格，現由所有覆寫入口共用。"""
+    st.selectbox("換人原因（必填）", OVERRIDE_REASONS, key=f"{key_prefix}_reason")
+    if st.session_state.get(f"{key_prefix}_reason") == "其他":
+        st.text_input("請說明其他原因（必填）", key=f"{key_prefix}_reason_detail")
+    return _resolve_reason(key_prefix)
 
 
 def _reassign_confirm_click(task_id, current_cg_id, sel_key, error_key, success_key, on_reassign) -> None:
     chosen = st.session_state.get(sel_key, current_cg_id)
-    err = on_reassign(task_id, chosen)
+    reason = _resolve_reason(sel_key)
+    err = on_reassign(task_id, chosen, reason)
     if err:
         st.session_state[error_key] = err
         st.session_state[sel_key] = current_cg_id
@@ -483,18 +493,17 @@ def _reassign_cancel_click(current_cg_id, sel_key, error_key) -> None:
     st.session_state.pop(error_key, None)
 
 
-def _unassigned_assign_click(task_id, cg_id, sel_key, error_key, success_key, on_reassign) -> None:
-    err = on_reassign(task_id, cg_id)
+def _task_override_confirm_click(task_id, current_cg_id, sel_key, error_key, success_key, on_reassign) -> None:
+    chosen = st.session_state.get(sel_key, current_cg_id)
+    new_cg = None if chosen == OVERRIDE_UNASSIGN else chosen
+    reason = _resolve_reason(sel_key)
+    err = on_reassign(task_id, new_cg, reason)
     if err:
         st.session_state[error_key] = err
     else:
         st.session_state.pop(error_key, None)
         st.session_state[success_key] = True
-        st.session_state[f"{success_key}_detail"] = (task_id, cg_id)
-
-
-def _unassigned_cancel_click(error_key) -> None:
-    st.session_state.pop(error_key, None)
+        st.session_state[f"{success_key}_detail"] = (task_id, new_cg if new_cg is not None else "未指派")
 
 
 def _candidate_option_label(cg_id: str, ranked_by_id: dict, current_cg_id: Optional[str] = None) -> str:
@@ -503,11 +512,12 @@ def _candidate_option_label(cg_id: str, ranked_by_id: dict, current_cg_id: Optio
     色塊標籤；下方的可派狀態摘要另以色塊呈現整體分布，兩者互補。
 
     current_cg_id 為選填：僅「居服員 x 日期」改派 Modal（_quick_reassign_dialog，
-    有現任指派對象）會傳入；「未派單案件」快速指派 Modal（_unassigned_task_dialog）
-    刻意不傳（維持預設 None），因為未派單案件本來就沒有現任居服員，「（目前指派）」
-    這個分支必須從結構上就不可能被觸發，而不是仰賴傳入一個不會匹配到任何真實
-    居服員 ID 的哨兵值（例如空字串）這種容易被誤用或誤刪的技巧。
+    有現任指派對象）與單一任務覆寫 Modal（_task_override_dialog，任務已指派時）
+    會傳入；任務原本未指派時傳 None，「（目前指派）」這個分支從結構上就不可能
+    被觸發，而不是仰賴傳入一個不會匹配到任何真實居服員 ID 的哨兵值。
     """
+    if cg_id == OVERRIDE_UNASSIGN:
+        return f"{OVERRIDE_UNASSIGN}（目前狀態）" if current_cg_id is None else OVERRIDE_UNASSIGN
     if current_cg_id is not None and cg_id == current_cg_id:
         return f"{cg_id}（目前指派）"
     info = ranked_by_id.get(cg_id)
@@ -535,10 +545,11 @@ def _quick_reassign_dialog(
 ) -> None:
     """月曆快速改派 Modal：列出 cg_id 於 day 的任務，逐筆提供改派下拉選單。
 
-    每次改派皆委派給呼叫端注入的 on_reassign(task_id, new_cg_id) -> Optional[str]
+    每次改派皆委派給呼叫端注入的 on_reassign(task_id, new_cg_id, reason) -> Optional[str]
     （app.py 中實作，內部呼叫 caregiver_engine.check_reassignment_conflict 做即時
     衝突檢查，通過後才寫入 overrides 與稽核日誌）；本函式只負責顯示成功/錯誤結果，
-    不自行判斷是否可改派。
+    不自行判斷是否可改派。reason 由 _reason_picker 收集（必填，與原④區塊逐筆列表
+    的原因欄位規格相同），確認按鈕在原因未填妥前停用。
 
     候選名單一律取「機構內全體居服員」（df_cg，排除 cg_id 本人），不會用 Phase 1
     的候選配對名單事先篩過一輪——那是給 AI 自動媒合找最佳解用的，會把性別不符、
@@ -669,9 +680,11 @@ def _quick_reassign_dialog(
 
                 if chosen != str(cg_id):
                     st.warning(f"確定要將任務 {t_id} 由 **{cg_id}** 改派給 **{chosen}** 嗎？")
+                    reason = _reason_picker(sel_key)
                     c1, c2 = st.columns(2)
                     c1.button(
                         "✅ 確認改派", key=f"confirm_{sel_key}", width="stretch",
+                        disabled=not reason.strip(),
                         on_click=_reassign_confirm_click,
                         args=(t_id, str(cg_id), sel_key, error_key, success_key, on_reassign),
                     )
@@ -686,54 +699,55 @@ def _quick_reassign_dialog(
         st.rerun()
 
 
-@st.dialog("🚩 未派單案件處置", width="large")
-def _unassigned_task_dialog(
+@st.dialog("🔍 任務覆寫", width="large")
+def _task_override_dialog(
     task_id: str,
     df_tasks: pd.DataFrame,
     df_cg: pd.DataFrame,
-    df_result_effective: pd.DataFrame,
+    df_result: pd.DataFrame,
+    overrides: dict,
     on_reassign,
+    on_clear_override=None,
     on_list_candidates=None,
 ) -> None:
-    """未派單案件快速指派 Modal：顯示案件詳情，列出全體居服員候選人＋未派原因標籤。
+    """單一任務覆寫 Modal：涵蓋「已指派任務改派／撤銷」與「未派單任務快速指派」
+    兩種情境，取代原④區塊「居督人工覆寫」逐筆列出全部任務的 expander 清單，
+    也是月曆視角「未派單案件」的處置入口——兩者本來就走同一套
+    on_reassign(task_id, new_cg_id, reason) -> Optional[str] 覆寫邏輯（app.py 的
+    _quick_reassign，內部呼叫 caregiver_engine.check_reassignment_conflict 做即時
+    衝突檢查，通過後才寫入 overrides 與稽核日誌；apply_overrides_to_result 本就
+    支援替未指派任務新增覆寫列），合併為一套介面可少維護一份重複邏輯。
 
-    指派本身委派給呼叫端注入的 on_reassign(task_id, new_cg_id) -> Optional[str]
-    ——與 _quick_reassign_dialog 共用同一個 callback（app.py 的 _quick_reassign）：
-    「原本已指派」與「原本未指派」的任務走同一套 check_reassignment_conflict＋
-    overrides 寫入邏輯，因為 apply_overrides_to_result 本就支援替未指派任務新增
-    覆寫列，不需要另外實作一套指派流程。
+    df_result 為呼叫端傳入的『AI 原始結果』（未套用 overrides），本函式自行比對
+    overrides dict 算出「AI 建議」與「目前實際生效」兩個狀態分開顯示，讓居督看得
+    出這筆任務是否已被覆寫過、覆寫成什麼、原因為何；existing_override 存在時另外
+    提供「清除覆寫」按鈕（委派給 on_clear_override，不寫入稽核日誌，與原④區塊
+    「清除覆寫，還原 AI 建議」行為一致）。
 
-    候選名單一律取「機構內全體居服員」，並在提供 on_list_candidates 時（app.py 的
-    _list_candidates，內部呼叫 caregiver_engine.rank_candidates_by_availability）
-    依「是否符合派單資格」分成推薦人選（可派單）與其他人選（附具體未派原因：
-    時間衝突／硬性資格條件不符，如性別、證照、環境排斥、休假、可服務時段、工時
-    上限），讓居督不必逐一試錯即可判斷。選擇「其他人選」中的任何一位仍可送出
-    （強制派單），因為本系統無強制派單權限機制，最終判斷權在居督。
+    候選名單一律取「機構內全體居服員」＋一個「撤銷指派」選項，並在提供
+    on_list_candidates 時（app.py 的 _list_candidates，內部呼叫
+    caregiver_engine.rank_candidates_by_availability）依「是否符合派單資格」標籤
+    ＋排序，讓居督不必逐一試錯即可判斷；不合資格者仍可選取（本系統無強制派單
+    權限機制，最終判斷權在居督）。選擇與目前生效指派不同的對象後才需要填寫覆寫
+    原因（必填，見 _reason_picker），與原④區塊規格相同。
     """
-    success_key = "calendar_unassigned_assign_success"
+    success_key = "task_override_success"
     if st.session_state.pop(success_key, False):
-        # 見 _quick_reassign_dialog 同一位置的說明：overrides 更新後，
-        # df_result_effective 內容改變，@st.cache_data 的內容雜湊會自然失效
-        # 重算，矩陣與未派單清單下一次 rerun 就會反映最新狀態。
         detail = st.session_state.pop(f"{success_key}_detail", None)
         if detail:
-            st.toast(f"✅ 已將任務 {detail[0]} 指派給 {detail[1]}", icon="✅")
+            st.toast(f"✅ 任務 {detail[0]} 已更新為：{detail[1]}", icon="✅")
         else:
-            st.toast("✅ 指派成功！", icon="✅")
+            st.toast("✅ 已更新！", icon="✅")
         st.session_state["calendar_active_dialog"] = None
         st.rerun()
 
     task_info = df_tasks.set_index("任務ID")
     if task_id not in task_info.index:
         st.info("找不到此任務資料（可能資料已更新）。")
-        if st.button("✕ 關閉", key=f"close_unassigned_missing_{task_id}"):
+        if st.button("✕ 關閉", key=f"close_task_override_missing_{task_id}"):
             st.session_state["calendar_active_dialog"] = None
             st.rerun()
         return
-
-    already_assigned = (
-        not df_result_effective.empty and (df_result_effective["任務ID"] == task_id).any()
-    )
 
     t_row = task_info.loc[task_id]
     has_service_type = "派單要求服務類型" in df_tasks.columns
@@ -747,31 +761,37 @@ def _unassigned_task_dialog(
         + (f"　🔥 {priority}" if priority else "")
     )
 
-    if already_assigned:
-        current_cg = df_result_effective.loc[df_result_effective["任務ID"] == task_id, "派單居服員"].iloc[0]
-        st.success(f"此案件已於稍早指派給 **{current_cg}**，無需再次處置。")
-        if st.button("✕ 關閉", key=f"close_unassigned_done_{task_id}"):
-            st.session_state["calendar_active_dialog"] = None
-            st.rerun()
-        return
+    ai_row = df_result[df_result["任務ID"] == task_id] if not df_result.empty else pd.DataFrame()
+    ai_cg = str(ai_row.iloc[0]["派單居服員"]) if not ai_row.empty else None
+
+    existing_override = (overrides or {}).get(task_id)
+    if existing_override:
+        current_cg = existing_override["cg_id"]
+        st.caption(
+            f"AI 建議：{ai_cg or '未指派'}　→　居督已覆寫為："
+            f"**{current_cg or '未指派'}**（{existing_override['reason']}）"
+        )
+    else:
+        current_cg = ai_cg
+        st.caption(f"AI 建議：**{ai_cg or '未指派'}**（尚未覆寫）")
 
     if on_reassign is None:
-        st.info("快速指派功能目前未啟用（呼叫端尚未提供 on_reassign callback）。")
-        if st.button("✕ 關閉", key=f"close_unassigned_noop_{task_id}"):
+        st.info("覆寫功能目前未啟用（呼叫端尚未提供 on_reassign callback）。")
+        if st.button("✕ 關閉", key=f"close_task_override_noop_{task_id}"):
             st.session_state["calendar_active_dialog"] = None
             st.rerun()
         return
 
-    avail_only_key = f"unassigned_avail_only_{task_id}"
+    avail_only_key = f"task_override_avail_only_{task_id}"
     show_available_only = st.toggle(
-        "僅顯示推薦人選（無衝突且符合資格）", value=False, key=avail_only_key,
+        "僅顯示有空檔且符合資格人選", value=False, key=avail_only_key,
         help="開啟後，只列出該時段無時間衝突、且符合性別/證照/環境等硬性資格條件的居服員；"
         "關閉時仍列出全部候選人，未達推薦條件者會標示具體原因。",
     )
 
     all_cg_ids = sorted(df_cg["居服員ID"].astype(str).unique().tolist()) if not df_cg.empty else []
 
-    sel_key = f"unassigned_assign_{task_id}"
+    sel_key = f"task_override_sel_{task_id}"
     error_key = f"{sel_key}_error"
 
     ranked_by_id = {}
@@ -783,56 +803,44 @@ def _unassigned_task_dialog(
         conflicted_ids = [r["cg_id"] for r in ranked if not r["available"]]
 
     if ranked_by_id:
-        if available_ids:
-            st.caption(f"🟢 {len(available_ids)} 位推薦人選　🔴 {len(conflicted_ids)} 位其他人選（列有未派原因）")
-        else:
-            st.caption("⚠ 目前查無完全符合條件的推薦人選，以下為全部候選人及未派原因。")
+        st.caption(f"🟢 {len(available_ids)} 位可派單　🔴 {len(conflicted_ids)} 位有衝突或不符資格")
 
     candidate_ids = available_ids if show_available_only else available_ids + conflicted_ids
+    options = [OVERRIDE_UNASSIGN] + candidate_ids
 
-    if not candidate_ids:
-        st.warning(
-            "目前無任何候選居服員可供選擇。" if not all_cg_ids
-            else "已開啟「僅顯示推薦人選」，但目前無人符合條件；可關閉此選項查看全部候選人。"
+    default_val = OVERRIDE_UNASSIGN if current_cg is None else str(current_cg)
+    if st.session_state.get(sel_key) not in options:
+        st.session_state[sel_key] = default_val if default_val in options else OVERRIDE_UNASSIGN
+
+    chosen = st.selectbox(
+        "指定居服員", options, key=sel_key,
+        format_func=lambda v: _candidate_option_label(v, ranked_by_id, current_cg_id=current_cg),
+    )
+
+    if st.session_state.get(error_key):
+        st.error(f"⚠️ 覆寫失敗：{st.session_state[error_key]}")
+
+    chosen_cg = None if chosen == OVERRIDE_UNASSIGN else chosen
+    if chosen_cg != current_cg:
+        chosen_info = ranked_by_id.get(chosen_cg) if chosen_cg else None
+        if chosen_info is not None and not chosen_info["available"]:
+            st.warning(f"⚠️ **{chosen}**：{chosen_info['detail'] or '不符合建議派單條件'}。")
+        reason = _reason_picker(sel_key)
+        st.button(
+            "✅ 確認覆寫", key=f"confirm_{sel_key}", width="stretch", disabled=not reason.strip(),
+            on_click=_task_override_confirm_click,
+            args=(task_id, current_cg, sel_key, error_key, success_key, on_reassign),
         )
     else:
-        if st.session_state.get(sel_key) not in candidate_ids:
-            st.session_state[sel_key] = candidate_ids[0]
+        st.caption("選擇與目前生效指派不同的居服員／撤銷指派後，即可填寫原因並確認覆寫。")
 
-        chosen = st.selectbox(
-            "選擇欲指派的居服員", candidate_ids, key=sel_key,
-            format_func=lambda v: _candidate_option_label(v, ranked_by_id),
-        )
+    if existing_override and on_clear_override is not None:
+        if st.button("↩️ 清除覆寫，還原 AI 建議", key=f"clear_{sel_key}", width="stretch"):
+            on_clear_override(task_id)
+            st.session_state["calendar_active_dialog"] = None
+            st.rerun()
 
-        if st.session_state.get(error_key):
-            st.error(f"⚠️ 指派失敗：{st.session_state[error_key]}")
-
-        chosen_info = ranked_by_id.get(chosen)
-        chosen_available = chosen_info["available"] if chosen_info is not None else True
-
-        if chosen_available:
-            st.success(f"**{chosen}** 該時段無衝突，符合派單資格。")
-            st.button(
-                "✅ 確認指派", key=f"confirm_{sel_key}", width="stretch",
-                on_click=_unassigned_assign_click,
-                args=(task_id, chosen, sel_key, error_key, success_key, on_reassign),
-            )
-        else:
-            reason_text = chosen_info["detail"] if chosen_info else "不符合建議派單條件"
-            st.warning(f"⚠️ **{chosen}**：{reason_text}。確定要強制派單嗎？")
-            c1, c2 = st.columns(2)
-            c1.button(
-                "⚠️ 強制指派", key=f"confirm_{sel_key}", width="stretch",
-                on_click=_unassigned_assign_click,
-                args=(task_id, chosen, sel_key, error_key, success_key, on_reassign),
-            )
-            c2.button(
-                "✕ 取消", key=f"cancel_{sel_key}", width="stretch",
-                on_click=_unassigned_cancel_click,
-                args=(error_key,),
-            )
-
-    if st.button("✕ 關閉", key=f"close_unassigned_{task_id}"):
+    if st.button("✕ 關閉", key=f"close_task_override_{task_id}"):
         st.session_state["calendar_active_dialog"] = None
         st.rerun()
 
@@ -852,11 +860,12 @@ def render_calendar_overview(
     caregiver_engine.py 的排班演算法。僅在 df_tasks 具備「日期」欄位（月批次排班
     模式）時顯示完整功能；否則顯示提示並直接返回。
 
-    on_reassign（快速改派／指派 callback，見 _quick_reassign_dialog 與
-    _unassigned_task_dialog）與 on_list_candidates（依空檔＋資格排序候選人
-    callback）皆為選填：未提供時月曆總覽仍會正常顯示，僅快速改派／未派單指派／
-    空檔排序功能不可用或退回未排序清單。候選名單一律取 df_cg 全體居服員（見
-    _quick_reassign_dialog），不依賴 Phase 1 的候選配對結果。
+    on_reassign（快速改派 callback，見 _quick_reassign_dialog）與 on_list_candidates
+    （依空檔＋資格排序候選人 callback）皆為選填：未提供時月曆總覽仍會正常顯示，僅
+    快速改派／空檔排序功能不可用或退回未排序清單。候選名單一律取 df_cg 全體居服員
+    （見 _quick_reassign_dialog），不依賴 Phase 1 的候選配對結果。點擊「未派單」
+    徽章只設定 calendar_active_dialog（kind="task"）並導向該任務，實際 Modal 由
+    呼叫端另外呼叫的 render_task_override_picker 集中派送（見該函式說明）。
     """
     st.subheader("🗓️ 月曆班表總覽")
 
@@ -946,3 +955,73 @@ def render_calendar_overview(
             df_result_effective, df_tasks, df_cg, selected_date, "日期",
             on_reassign, on_list_candidates,
         )
+
+
+def render_task_override_picker(
+    df_tasks: pd.DataFrame,
+    df_result: pd.DataFrame,
+    df_cg: pd.DataFrame,
+    overrides: dict,
+    on_reassign=None,
+    on_clear_override=None,
+    on_list_candidates=None,
+) -> None:
+    """④「居督人工覆寫」區塊的主要內容：取代原本逐筆列出全部任務的 expander
+    清單，改為「搜尋／選擇單一任務 → 開啟覆寫 Modal（_task_override_dialog，與
+    月曆視角未派單處置共用同一份實作）」＋「目前已覆寫任務」精簡清單（筆數受限
+    於實際覆寫數，不受任務總數影響，故任務量再大也不會拖長頁面）。
+
+    df_result 須為呼叫端的『AI 原始結果』（未套用 overrides），與 overrides 一起
+    交給 _task_override_dialog 自行比對算出「AI 建議」vs「目前生效」；on_reassign／
+    on_list_candidates 與月曆視角「一鍵調班」共用同一個 callback 與同一套
+    calendar_active_dialog 狀態鍵（kind="task"），故不論是從這裡或從月曆「未派單」
+    按鈕開啟，都是同一個 Modal、同一套稽核紀錄。
+    """
+    overrides = overrides or {}
+    task_ids = df_tasks["任務ID"].tolist() if not df_tasks.empty else []
+    cl_map = df_tasks.set_index("任務ID")["案家ID"] if "案家ID" in df_tasks.columns else {}
+    assigned_map = dict(zip(df_result["任務ID"], df_result["派單居服員"])) if not df_result.empty else {}
+
+    if not task_ids:
+        st.info("目前無任務可供覆寫。")
+    else:
+        def _task_option_label(t_id) -> str:
+            cl_id = cl_map.get(t_id, "")
+            ai_cg = assigned_map.get(t_id) or "未指派"
+            ov = overrides.get(t_id)
+            if ov:
+                cur = ov["cg_id"] if ov["cg_id"] is not None else "未指派"
+                return f"{t_id}（案家{cl_id}）AI:{ai_cg} → 已覆寫:{cur}"
+            return f"{t_id}（案家{cl_id}）AI 建議:{ai_cg}"
+
+        picker_key = "task_override_picker_select"
+        chosen_task = st.selectbox(
+            "選擇任務進行覆寫", task_ids, key=picker_key, format_func=_task_option_label,
+        )
+        if st.button("🔍 開啟覆寫視窗", key="task_override_picker_open"):
+            st.session_state["calendar_active_dialog"] = {"kind": "task", "task_id": chosen_task}
+            st.rerun()
+
+    if overrides:
+        st.caption(f"目前已覆寫 {len(overrides)} 筆任務：")
+        for t_id, ov in overrides.items():
+            cur = ov["cg_id"] if ov["cg_id"] is not None else "未指派"
+            c1, c2, c3 = st.columns([3, 2, 1])
+            c1.write(f"任務 {t_id}（案家 {cl_map.get(t_id, '')}）→ **{cur}**")
+            c2.caption(ov["reason"])
+            if on_clear_override is not None and c3.button("↩️ 清除", key=f"override_list_clear_{t_id}"):
+                on_clear_override(t_id)
+                st.rerun()
+    else:
+        st.caption("目前尚無任何居督覆寫紀錄。")
+
+    active_dialog = st.session_state.get("calendar_active_dialog")
+    if active_dialog and active_dialog.get("kind") == "task":
+        active_task_id = active_dialog.get("task_id")
+        if active_task_id in set(task_ids):
+            _task_override_dialog(
+                active_task_id, df_tasks, df_cg, df_result, overrides,
+                on_reassign, on_clear_override, on_list_candidates,
+            )
+        else:
+            st.session_state["calendar_active_dialog"] = None
