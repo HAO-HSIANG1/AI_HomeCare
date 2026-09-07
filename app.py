@@ -600,6 +600,96 @@ if "last_result" in st.session_state:
             mime="text/csv",
         )
 
+        # ==========================================
+        # Explainable AI：Why this schedule?
+        # ==========================================
+        st.subheader("🔎 Why this schedule?")
+        st.caption(
+            "查看 AI 為何推薦此居服員。適配分數由專長、照護連續性、"
+            "歷史服務品質、交通與工作負荷等因素共同組成。"
+        )
+
+        selected_task = st.selectbox(
+            "選擇任務查看 AI 推薦原因",
+            df_result["任務ID"].astype(str).tolist(),
+            key="explain_task_selector",
+        )
+
+        selected_row = df_result[
+            df_result["任務ID"].astype(str) == str(selected_task)
+        ].iloc[0]
+
+        st.markdown(
+            f"""
+            **AI 推薦居服員：{selected_row['派單居服員']}**  
+            **適配分數：{float(selected_row['適配分數']):.1f} 分**  
+            **預估車程：{float(selected_row['預估車程(分)']):.1f} 分鐘**
+            """
+        )
+
+        # ------------------------------
+        # 人性化推薦理由
+        # ------------------------------
+        reasons = []
+
+        if selected_row.get("專長匹配加分", 0) > 0:
+            reasons.append("具備符合本案需求的核心照護專長")
+
+        if selected_row.get("是否歷史首選", False):
+            reasons.append("為案家歷史首選居服員，有助維持照護連續性")
+
+        if selected_row.get("連續性品質加分", 0) > 0:
+            reasons.append("歷史服務滿意度達設定門檻")
+
+        if selected_row.get("交通扣分", 0) <= 10:
+            reasons.append("交通成本相對較低")
+
+        if selected_row.get("疲勞扣分", 0) <= 5:
+            reasons.append("目前工作負荷相對可接受")
+
+        if reasons:
+            st.markdown("**主要推薦理由**")
+            for reason in reasons:
+                st.write(f"✓ {reason}")
+        # ------------------------------
+        # 分數明細
+        # ------------------------------
+        explain_df = pd.DataFrame(
+            {
+                "評分項目": [
+                    "基礎分",
+                    "專長匹配",
+                    "歷史首選",
+                    "連續性品質",
+                    "滿意度調整",
+                    "交通成本",
+                    "疲勞／工作負荷",
+                ],
+                "分數影響": [
+                    float(selected_row.get("基礎分", 0)),
+                    float(selected_row.get("專長匹配加分", 0)),
+                    float(selected_row.get("歷史首選加分", 0)),
+                    float(selected_row.get("連續性品質加分", 0)),
+                    float(selected_row.get("滿意度調整", 0)),
+                    -float(selected_row.get("交通扣分", 0)),
+                    -float(selected_row.get("疲勞扣分", 0)),
+                ],
+            }
+        )
+
+        with st.expander("📊 查看完整適配分數明細"):
+            st.dataframe(
+                explain_df,
+                width="stretch",
+                hide_index=True,
+            )
+
+            st.caption(
+                "所有候選居服員皆須先通過資格、工時、時段及時空衝突等硬性條件；"
+                "上述分數僅用於合法可行候選方案之間的比較。"
+            )
+
+
     # ==========================================
     # 區塊④：居督人工覆寫（Supervisor Override）與稽核日誌
     # ==========================================
@@ -616,11 +706,11 @@ if "last_result" in st.session_state:
 
     override_log_df = load_override_log()
     travel_reason_count = (
-        (override_log_df["變更原因"] == "車程太遠").sum() if not override_log_df.empty else 0
+        (override_log_df["變更原因"] == "車程／交通因素").sum() if not override_log_df.empty else 0
     )
     if travel_reason_count >= OVERRIDE_TRAVEL_ALERT_THRESHOLD:
         st.warning(
-            f"📈 稽核日誌累計已有 {travel_reason_count} 筆覆寫原因為「車程太遠」，"
+            f"📈 稽核日誌累計已有 {travel_reason_count} 筆覆寫原因為「車程／交通因素」，"
             "建議提高側邊欄的『車程扣分權重』，讓 AI 派單更優先考量就近指派。"
         )
 

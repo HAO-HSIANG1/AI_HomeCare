@@ -570,52 +570,167 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
             cert = cg["核心專長證照"]
 
             # --- Soft Match Scoring ---
-            score = config.base_score
+            # 0. 基礎分
+            base_score = config.base_score
+
+            # 1. 專長匹配
+            skill_bonus = 0.0
 
             if req_type == "失智引導與精神陪伴" and cert in [
                 "失智症照顧專長",
                 "精神疾病照顧專長",
             ]:
-                score += config.cert_bonus_dementia
-            elif req_type in ["管路安全與特殊日常照護", "餐食照顧/管灌"] and cert == "單一級照服證照":
-                score += config.cert_bonus_other
+                skill_bonus = config.cert_bonus_dementia
+
+            elif (
+                req_type in ["管路安全與特殊日常照護", "餐食照顧/管灌"]
+                and cert == "單一級照服證照"
+            ):
+                skill_bonus = config.cert_bonus_other
+
+
+            # 2. 照護連續性
+            continuity_bonus = 0.0
+            continuity_performance_bonus = 0.0
 
             if is_preferred:
-                # 照護連續性為最高指導原則：基礎加分已大幅提高，避免微幅車程/成本優化
-                # 就任意更換案家熟悉的居服員；表現優良（滿意度達門檻）者再疊加動態加成。
-                score += config.preferred_caregiver_bonus
-                if cg["歷史滿意度均值"] >= config.continuity_satisfaction_threshold:
-                    score += config.continuity_performance_bonus
+                continuity_bonus = config.preferred_caregiver_bonus
 
-            score += (cg["歷史滿意度均值"] - config.satisfaction_baseline) * config.satisfaction_weight
-            score -= min(travel_time_min * config.travel_penalty_weight, config.travel_penalty_cap)
+                if (
+                    cg["歷史滿意度均值"]
+                    >= config.continuity_satisfaction_threshold
+                ):
+                    continuity_performance_bonus = (
+                        config.continuity_performance_bonus
+                    )
 
+
+            # 3. 歷史服務品質
+            satisfaction_adjustment = (
+                cg["歷史滿意度均值"]
+                - config.satisfaction_baseline
+            ) * config.satisfaction_weight
+
+
+            # 4. 交通成本
+            travel_penalty = min(
+                travel_time_min * config.travel_penalty_weight,
+                config.travel_penalty_cap
+            )
+
+
+            # 5. 疲勞 / 工作負荷
             intensity_weight = get_service_intensity_weight(task)
-            weighted_fatigue_hours = cg["當月累計服務時數(疲勞度)"] * intensity_weight
-            fatigue_penalty = (weighted_fatigue_hours / config.fatigue_reference_hours) * config.fatigue_weight
-            score -= fatigue_penalty
 
+            weighted_fatigue_hours = (
+                cg["當月累計服務時數(疲勞度)"]
+                * intensity_weight
+            )
+
+            fatigue_penalty = (
+                weighted_fatigue_hours
+                / config.fatigue_reference_hours
+            ) * config.fatigue_weight
+
+
+            # ==========================================
+            # 最終適配度分數
+            # ==========================================
+            score = (
+                base_score
+                + skill_bonus
+                + continuity_bonus
+                + continuity_performance_bonus
+                + satisfaction_adjustment
+                - travel_penalty
+                - fatigue_penalty
+            )
+
+
+            # ==========================================
+            # 保存結果
+            # ==========================================
             match_results.append(
                 {
                     "任務ID": t_id,
                     "案家ID": c_id,
                     "居服員ID": cg_id,
+
                     "適配度分數": round(max(score, 0), 2),
-                    "預估交通時間(分)": round(travel_time_min, 1),
-                    "任務開始時間": task["時間窗_開始"],
-                    "任務結束時間": task["時間窗_結束"],
-                    "優先級": task["任務優先級"],
-                    "地點緯度": client_lat,
-                    "地點經度": client_lon,
-                    "具備失智症20小時認證(0/1)": int(cert == "失智症照顧專長"),
-                    "具備精神疾病20小時認證(0/1)": int(cert == "精神疾病照顧專長"),
+
+                    # Explainable AI：分數組成
+                    "基礎分": round(base_score, 2),
+                    "專長匹配加分": round(skill_bonus, 2),
+                    "歷史首選加分": round(continuity_bonus, 2),
+                    "連續性品質加分": round(
+                        continuity_performance_bonus,
+                        2
+                    ),
+                    "滿意度調整": round(
+                        satisfaction_adjustment,
+                        2
+                    ),
+                    "交通扣分": round(
+                        travel_penalty,
+                        2
+                    ),
+                    "疲勞扣分": round(
+                        fatigue_penalty,
+                        2
+                    ),
+
+                    # Explainability 輔助資訊
+                    "是否歷史首選": bool(is_preferred),
+
+                    "當月累計服務時數": round(
+                        float(
+                            cg["當月累計服務時數(疲勞度)"]
+                        ),
+                        1
+                    ),
+
+                    "服務強度係數": round(
+                        float(intensity_weight),
+                        2
+                    ),
+
+                    # 原本欄位
+                    "預估交通時間(分)": round(
+                        travel_time_min,
+                        1
+                    ),
+
+                    "任務開始時間":
+                        task["時間窗_開始"],
+
+                    "任務結束時間":
+                        task["時間窗_結束"],
+
+                    "優先級":
+                        task["任務優先級"],
+
+                    "地點緯度":
+                        client_lat,
+
+                    "地點經度":
+                        client_lon,
+
+                    "具備失智症20小時認證(0/1)":
+                        int(
+                            cert == "失智症照顧專長"
+                        ),
+
+                    "具備精神疾病20小時認證(0/1)":
+                        int(
+                            cert == "精神疾病照顧專長"
+                        ),
                 }
             )
-
         if matched_count_for_task == 0:
             print(f"[Match Warning] 任務 {t_id} 找不到任何符合條件的居服員，剔除原因分佈：{reason_counts}")
 
     return pd.DataFrame(match_results)
+
 
 
 def _diagnose_caregiver_change(
@@ -1144,7 +1259,7 @@ def run_phase2_optimization(
         t_id = row["任務ID"]
         cg_id = row["居服員ID"]
         w_match = row["適配度分數"]
-        w_travel = row["預估交通時間(分)"]
+        #w_travel = row["預估交通時間(分)"]
         priority_bonus = (
             config.urgent_priority_bonus
             if "緊急" in str(row["優先級"])
@@ -1152,12 +1267,12 @@ def run_phase2_optimization(
         )
 
         is_preferred = cg_id == task_pref_cg_map.get(t_id)
-        travel_penalty_term = 0.0 if is_preferred else config.objective_travel_weight * w_travel
+        #travel_penalty_term = 0.0 if is_preferred else config.objective_travel_weight * w_travel
 
         revenue, _salary = task_revenue_map.get(t_id, (0.0, 0.0))
         revenue_score = revenue * config.revenue_score_weight
 
-        coeff = w_match - travel_penalty_term + priority_bonus + revenue_score
+        coeff = w_match  + priority_bonus + revenue_score
         objective.SetCoefficient(X[(t_id, cg_id)], coeff)
 
     objective.SetMaximization()
@@ -1188,6 +1303,17 @@ def run_phase2_optimization(
                         "地點經度": row_data["地點經度"],
                         "預估長照申報點數(營收)": revenue,
                         "預估居服員拆帳薪資": salary,
+                        "基礎分": row_data.get("基礎分", 0),
+
+                        "專長匹配加分": row_data.get("專長匹配加分", 0),
+                        "歷史首選加分": row_data.get("歷史首選加分", 0),
+                        "連續性品質加分": row_data.get("連續性品質加分", 0),
+                        "滿意度調整": row_data.get("滿意度調整", 0),
+                        "交通扣分": row_data.get("交通扣分", 0),
+                        "疲勞扣分": row_data.get("疲勞扣分", 0),
+                        "是否歷史首選": row_data.get("是否歷史首選", False),
+                        "當月累計服務時數": row_data.get("當月累計服務時數", 0),
+                        "服務強度係數": row_data.get("服務強度係數", 1),
                     }
                 )
 
