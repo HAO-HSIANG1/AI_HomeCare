@@ -130,42 +130,48 @@ with st.sidebar:
         st.rerun()
 
     buffer_mins = st.slider(
-        "轉場與交接緩衝時間（分鐘）", 0.0, 60.0, defaults.buffer_mins, 1.0,
+        "任務間轉場緩衝時間（分鐘）", 0.0, 60.0, defaults.buffer_mins, 1.0,
         key="cfg_buffer_mins",
-        help="居服員完成一項任務後，考量停車、上下樓、門禁核對與交接紀錄所需的緩衝時間。",
+        help="兩個服務任務之間，除實際交通時間外額外預留的緩衝時間，"
+        "用於停車、步行、上下樓、門禁、服務紀錄及臨時延誤。",
     )
     travel_penalty_weight = st.slider(
         "車程扣分權重（分／分鐘）", 0.0, 5.0, defaults.travel_penalty_weight, 0.1,
         key="cfg_travel_penalty_weight",
-        help="每一分鐘車程對適配度分數與派單目標函數的扣分幅度，數值越高代表越優先就近派案。"
-        "（此權重不影響案家歷史首選居服員：連續性優先於車程限制，詳見下方照護連續性加分說明。）",
+        help="每一分鐘預估車程對適配度分數的扣分幅度。"
+        "（目前車程扣分最高為 25 分，避免距離因素過度凌駕照護連續性。）",
     )
     urgent_priority_bonus = st.slider(
-        "緊急任務優先加分（分）", 0.0, 100.0, defaults.urgent_priority_bonus, 5.0,
+        "緊急任務派單優先權（分）", 0.0, 100.0, defaults.urgent_priority_bonus, 5.0,
         key="cfg_urgent_priority_bonus",
-        help="任務優先級標示為「緊急」時，在派單目標函數中額外獲得的加分，數值越高代表緊急任務越優先被指派。",
+        help= "用於整體排班最佳化。當人力或時段不足、無法完成所有任務時，"
+        "緊急任務會取得較高的派單優先度；不直接改變居服員本身的適配度。",
     )
     continuity_bonus = st.slider(
-        "照護連續性加分（分）", 0.0, 100.0, defaults.preferred_caregiver_bonus, 1.0,
+        "照護連續性加分（歷史首選居服員）", 0.0, 100.0, defaults.preferred_caregiver_bonus, 1.0,
         key="cfg_continuity_bonus",
-        help="當案家的歷史首選居服員恰為候選居服員時的加分，鼓勵維持既有照護關係與默契。"
-        "表現優良（滿意度達門檻）的首選居服員另有動態加成，避免因車程等微幅優化而被替換。",
+        help="若候選居服員等於案家的「歷史首選居服員ID」，即獲得此加分。"
+        "目前預設為 +60 分；若該居服員歷史滿意度 ≥ 4.3，系統另再加 +15 分。",
     )
     skill_bonus = st.slider(
         "核心專長匹配加分（分）", 0.0, 50.0, defaults.cert_bonus_dementia, 1.0,
         key="cfg_skill_bonus",
         help="居服員持有之核心專長證照符合案家特殊照護需求時的加分。",
     )
+
+    st.divider()
+    st.subheader("💰 財務試算設定")
+
     salary_rate_pct = st.slider(
         "居服員拆帳比例（%）", 0, 100, int(defaults.caregiver_salary_rate_per_point * 100), 5,
         key="cfg_salary_rate_pct",
-        help="居服員實領薪資佔該任務長照申報點數（機構營收）的比例，用於試算「預估居服員拆帳薪資」。",
+        help="僅用於估算居服員拆帳薪資，不作為居服員適配度的加減分依據。"
+        "正式導入時可依各機構實際薪資與拆帳制度設定。",
     )
 
 config = PipelineConfig(
     buffer_mins=buffer_mins,
     travel_penalty_weight=travel_penalty_weight,
-    objective_travel_weight=travel_penalty_weight,
     urgent_priority_bonus=urgent_priority_bonus,
     preferred_caregiver_bonus=continuity_bonus,
     cert_bonus_dementia=skill_bonus,
@@ -642,15 +648,16 @@ if "last_result" in st.session_state:
             reasons.append("歷史服務滿意度達設定門檻")
 
         if selected_row.get("交通扣分", 0) <= 10:
-            reasons.append("交通成本相對較低")
+            reasons.append("預估轉場車程較短")
 
-        if selected_row.get("疲勞扣分", 0) <= 5:
+        if selected_row.get("工作負荷扣分", 0) <= 5:
             reasons.append("目前工作負荷相對可接受")
-
+            
         if reasons:
             st.markdown("**主要推薦理由**")
             for reason in reasons:
                 st.write(f"✓ {reason}")
+
         # ------------------------------
         # 分數明細
         # ------------------------------
@@ -672,7 +679,7 @@ if "last_result" in st.session_state:
                     float(selected_row.get("連續性品質加分", 0)),
                     float(selected_row.get("滿意度調整", 0)),
                     -float(selected_row.get("交通扣分", 0)),
-                    -float(selected_row.get("疲勞扣分", 0)),
+                    -float(selected_row.get("工作負荷扣分", 0)),
                 ],
             }
         )
