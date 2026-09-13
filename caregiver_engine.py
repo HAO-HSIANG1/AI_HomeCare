@@ -1253,7 +1253,7 @@ def run_phase2_optimization(
         w_match = row["適配度分數"]
         priority_bonus = (
             config.urgent_priority_bonus
-            if "緊急" in str(row["優先級"])
+            if "高" in str(row["優先級"])
             else config.normal_priority_bonus
         )
 
