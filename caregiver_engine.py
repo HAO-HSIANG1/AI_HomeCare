@@ -113,6 +113,7 @@ class PipelineConfig:
     satisfaction_weight: float = 10.0
     travel_penalty_weight: float = 2.0
     travel_penalty_cap: float = 25.0
+    # 工作負荷平衡：若資料未提供「當月可排總工時」，預設以 160 小時作為月可用工時基準
     fatigue_reference_hours: float = 160.0
     fatigue_weight: float = 10.0
 
@@ -124,17 +125,12 @@ class PipelineConfig:
     preferred_caregiver_max_travel_minutes: Optional[float] = None
 
     # Phase 2：OR-Tools 目標函數權重
-    # 注意：objective_travel_weight 僅套用在「非歷史首選居服員」的候選配對；
-    # 歷史首選居服員的配對在目標函數中略過此懲罰項（詳見 run_phase2_optimization），
-    # 確保調高車程懲罰以追求整體路線效率時，仍不會犧牲照護連續性。
-    objective_travel_weight: float = 3.0
     urgent_priority_bonus: float = 50.0
     normal_priority_bonus: float = 20.0
 
-    # 財務試算：長照申報點數換算居服員薪資的拆帳比例，以及營收併入目標函數的縮放權重
-    # （例如每 100 點營收 ≈ 5 分適配度分數增益，對齊分數與點數量級）。
+    # 財務試算：長照申報點數換算居服員薪資的拆帳比例；
+    # 僅供結果顯示與財務 KPI 試算，不參與派單決策。
     caregiver_salary_rate_per_point: float = 0.65
-    revenue_score_weight: float = 0.05
 
 
 # ==========================================
@@ -173,7 +169,137 @@ def _get_task_field(row, base_col_name: str):
             return value
     return None
 
+def apply_service_duration(
+    tasks_df: pd.DataFrame,
+    service_code_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """依 Service_Code Master 的分鐘數，重算每筆任務服務歷時。"""
 
+    result = tasks_df.copy()
+
+    required_columns = [
+        "系統代碼",
+        "CareFlow排班分鐘(暫定)",
+        "是否納入CareFlow",
+    ]
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in service_code_df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "Service_Code 缺少必要欄位："
+            + "、".join(missing_columns)
+        )
+
+    master = service_code_df.copy()
+    master = master.dropna(subset=["系統代碼"])
+    master["系統代碼"] = (
+        master["系統代碼"].astype(str).str.strip()
+    )
+
+    duplicated_codes = master[
+        master["系統代碼"].duplicated(keep=False)
+    ]["系統代碼"].unique()
+
+    if len(duplicated_codes) > 0:
+        raise ValueError(
+            "Service_Code Master 有重複代碼："
+            + "、".join(duplicated_codes)
+        )
+
+    master = master.set_index("系統代碼")
+
+    calculated_minutes = []
+    calculation_details = []
+
+    for _, row in result.iterrows():
+        task_id = row.get("任務ID", "未知任務")
+        total_minutes = 0.0
+        details = []
+
+        for index in (1, 2):
+            code_raw = row.get(f"Service_Code_{index}")
+            units_raw = row.get(f"Units_{index}")
+
+            if pd.isna(code_raw) or str(code_raw).strip() == "":
+                continue
+
+            code = str(code_raw).strip()
+
+            if pd.isna(units_raw):
+                raise ValueError(
+                    f"任務 {task_id} 的 {code} 未填寫 Units"
+                )
+
+            try:
+                units = float(units_raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"任務 {task_id} 的 {code} Units 不是有效數字"
+                )
+
+            if units < 0:
+                raise ValueError(
+                    f"任務 {task_id} 的 {code} Units 不可小於 0"
+                )
+
+            if units == 0:
+                continue
+
+            if code not in master.index:
+                raise ValueError(
+                    f"任務 {task_id} 的服務碼 {code} "
+                    "不存在於 Service_Code Master"
+                )
+
+            master_row = master.loc[code]
+            status = str(
+                master_row["是否納入CareFlow"]
+            ).strip()
+
+            # AA07～AA11是附加碼，不另增加服務分鐘
+            if code.startswith("AA"):
+                details.append(f"{code}×{units:g}=0")
+                continue
+
+            if status in {"否", "否/另模組"}:
+                raise ValueError(
+                    f"任務 {task_id} 使用目前不支援排班的服務碼 {code}"
+                )
+
+            minutes = master_row["CareFlow排班分鐘(暫定)"]
+
+            if pd.isna(minutes):
+                raise ValueError(
+                    f"Service_Code Master 的 {code} "
+                    "尚未設定CareFlow排班分鐘"
+                )
+
+            subtotal = float(minutes) * units
+            total_minutes += subtotal
+            details.append(
+                f"{code}×{units:g}={subtotal:g}分鐘"
+            )
+
+        if total_minutes <= 0:
+            raise ValueError(
+                f"任務 {task_id} 無法計算出有效服務歷時"
+            )
+
+        calculated_minutes.append(total_minutes)
+        calculation_details.append(" + ".join(details))
+
+    # 保留Excel原有值，方便比較
+    if "服務歷時(分鐘)" in result.columns:
+        result["原服務歷時(分鐘)"] = result["服務歷時(分鐘)"]
+
+    result["服務歷時(分鐘)"] = calculated_minutes
+    result["服務歷時計算明細"] = calculation_details
+
+    return result
 # ==========================================
 # 申報法規防呆：BA 服務代碼併報合規檢核
 # ==========================================
@@ -621,15 +747,9 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
 
             # 5. 疲勞 / 工作負荷
             intensity_weight = get_service_intensity_weight(task)
-
-            weighted_fatigue_hours = (
-                cg["當月累計服務時數(疲勞度)"]
-                * intensity_weight
-            )
-
+            weighted_fatigue_hours = cg["當月累計服務時數(疲勞度)"] * intensity_weight
             fatigue_penalty = (
-                weighted_fatigue_hours
-                / config.fatigue_reference_hours
+                 weighted_fatigue_hours / config.fatigue_reference_hours
             ) * config.fatigue_weight
 
 
@@ -674,7 +794,7 @@ def run_phase1_matching(tasks: pd.DataFrame, df_cg: pd.DataFrame, config: Pipeli
                         travel_penalty,
                         2
                     ),
-                    "疲勞扣分": round(
+                    "工作負荷扣分": round(
                         fatigue_penalty,
                         2
                     ),
@@ -1238,41 +1358,36 @@ def run_phase2_optimization(
             <= cap_hours
         )
 
-    # 財務試算：每筆任務的長照申報點數（營收）與居服員拆帳薪資，供目標函數與輸出結果共用。
+    # 財務試算：每筆任務的長照申報點數（營收）與居服員拆帳薪資，
+    # 僅供結果顯示與財務 KPI 試算，不參與派單目標函數。
     tasks_with_revenue = calculate_task_revenue_and_salary(tasks, config)
     task_revenue_map = {
         row["任務ID"]: (row["預估長照申報點數(營收)"], row["預估居服員拆帳薪資"])
         for _, row in tasks_with_revenue.iterrows()
     }
-    task_pref_cg_map = {row["任務ID"]: row["歷史首選居服員ID"] for _, row in tasks.iterrows()}
 
-    # 目標函數：Z = 適配度分數 - w*交通時間 + 優先級權重 + 財務營收權重
+    # Phase 2 目標函數：
+    # 在通過所有硬性條件與時空衝突檢查的候選方案中，
+    # 最大化 Phase 1 適配度分數與任務優先權。
+    # 車程已納入 Phase 1 適配度計算，不重複扣分；
+    # 財務營收僅供結果顯示與 KPI 試算，不參與派單決策。
     #
     # 「照護連續性」優先於「車程限制」的原則亦須貫徹到此目標函數層級：若僅單純調高
-    # objective_travel_weight 以追求整體路線效率，未加區別地套用在所有候選配對上，
     # 反而會讓車程較遠但為案家歷史首選的居服員，在整體最佳化階段被距離較近的陌生
     # 居服員取代——這違背了 Phase 1 刻意給予首選居服員高額連續性加分的用意（其車程
     # 成本已由 Phase 1 的 travel_penalty_cap 合理封頂）。因此歷史首選居服員的配對在
-    # 此處略過 objective_travel_weight 懲罰項，僅一般候選人受其約束。
     objective = solver.Objective()
     for _, row in df_valid.iterrows():
         t_id = row["任務ID"]
         cg_id = row["居服員ID"]
         w_match = row["適配度分數"]
-        #w_travel = row["預估交通時間(分)"]
         priority_bonus = (
             config.urgent_priority_bonus
-            if "緊急" in str(row["優先級"])
+            if "高" in str(row["優先級"])
             else config.normal_priority_bonus
         )
 
-        is_preferred = cg_id == task_pref_cg_map.get(t_id)
-        #travel_penalty_term = 0.0 if is_preferred else config.objective_travel_weight * w_travel
-
-        revenue, _salary = task_revenue_map.get(t_id, (0.0, 0.0))
-        revenue_score = revenue * config.revenue_score_weight
-
-        coeff = w_match  + priority_bonus + revenue_score
+        coeff = w_match  + priority_bonus 
         objective.SetCoefficient(X[(t_id, cg_id)], coeff)
 
     objective.SetMaximization()
@@ -1310,7 +1425,7 @@ def run_phase2_optimization(
                         "連續性品質加分": row_data.get("連續性品質加分", 0),
                         "滿意度調整": row_data.get("滿意度調整", 0),
                         "交通扣分": row_data.get("交通扣分", 0),
-                        "疲勞扣分": row_data.get("疲勞扣分", 0),
+                        "工作負荷扣分": row_data.get("工作負荷扣分", 0),
                         "是否歷史首選": row_data.get("是否歷史首選", False),
                         "當月累計服務時數": row_data.get("當月累計服務時數", 0),
                         "服務強度係數": row_data.get("服務強度係數", 1),

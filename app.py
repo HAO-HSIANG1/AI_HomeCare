@@ -32,6 +32,7 @@ from calendar_view import apply_overrides_to_result, render_calendar_overview, r
 from caregiver_engine import (
     DEFAULT_EXCEL_PATH,
     PipelineConfig,
+    apply_service_duration,
     check_reassignment_conflict,
     get_weekday_name,
     load_override_log,
@@ -85,7 +86,7 @@ ORANGE = "#eb6834"
 MUTED = "#898781"
 GOOD = "#0ca30c"
 
-FIXED_REQUIRED_SHEETS = ["Caregiver_Profiles", "Client_Profiles", "Historical_Service_Logs"]
+FIXED_REQUIRED_SHEETS = ["Caregiver_Profiles", "Client_Profiles", "Historical_Service_Logs","Service_Code"]
 
 # 任務工作表名稱彈性相容：優先偵測月批次格式，其次退回現行單日格式。
 TASKS_SHEET_CANDIDATES = ["Monthly_Pending_Tasks", "Today_Pending_Tasks"]
@@ -103,10 +104,17 @@ REQUIRED_COLUMNS = {
     "Historical_Service_Logs": [
         "居服員ID", "案家ID", "歷史媒合機制(Treatment)", "不滿意導致提早結案(0/1)", "案家滿意度(1-5)",
     ],
+    "Service_Code": [
+        "系統代碼",
+        "CareFlow排班分鐘(暫定)",
+        "是否納入CareFlow",
+    ],
 }
 # 任務工作表的必要欄位為兩種格式共通的欄位；「今日既定行程」「可排班星期」等
 # 各版本專屬欄位皆為選填——caregiver_engine 已能在欄位缺席時安全跳過對應檢查。
-REQUIRED_TASKS_COLUMNS = ["任務ID", "案家ID", "時間窗_開始", "時間窗_結束", "服務歷時(分鐘)", "任務優先級"]
+REQUIRED_TASKS_COLUMNS = ["任務ID", "案家ID", "時間窗_開始", "時間窗_結束", "任務優先級", "Service_Code_1", "Units_1",]
+#移除："服務歷時(分鐘)"因為它之後由程式計算，不再是工程師必須提供的原始欄位。
+#Service_Code_2、Units_2不用列為必填，因為有些任務只有一個服務碼。
 
 st.set_page_config(page_title="長照居家照顧 AI 派單系統", page_icon="🏠", layout="wide")
 st.title("🏠 長照居家照顧 AI 派單系統")
@@ -130,42 +138,48 @@ with st.sidebar:
         st.rerun()
 
     buffer_mins = st.slider(
-        "轉場與交接緩衝時間（分鐘）", 0.0, 60.0, defaults.buffer_mins, 1.0,
+        "任務間轉場緩衝時間（分鐘）", 0.0, 60.0, defaults.buffer_mins, 1.0,
         key="cfg_buffer_mins",
-        help="居服員完成一項任務後，考量停車、上下樓、門禁核對與交接紀錄所需的緩衝時間。",
+        help="兩個服務任務之間，除實際交通時間外額外預留的緩衝時間，"
+        "用於停車、步行、上下樓、門禁、服務紀錄及臨時延誤。",
     )
     travel_penalty_weight = st.slider(
         "車程扣分權重（分／分鐘）", 0.0, 5.0, defaults.travel_penalty_weight, 0.1,
         key="cfg_travel_penalty_weight",
-        help="每一分鐘車程對適配度分數與派單目標函數的扣分幅度，數值越高代表越優先就近派案。"
-        "（此權重不影響案家歷史首選居服員：連續性優先於車程限制，詳見下方照護連續性加分說明。）",
+        help="每一分鐘預估車程對適配度分數的扣分幅度。"
+        "（目前車程扣分最高為 25 分，避免距離因素過度凌駕照護連續性。）",
     )
     urgent_priority_bonus = st.slider(
-        "緊急任務優先加分（分）", 0.0, 100.0, defaults.urgent_priority_bonus, 5.0,
+        "緊急任務派單優先權（分）", 0.0, 100.0, defaults.urgent_priority_bonus, 5.0,
         key="cfg_urgent_priority_bonus",
-        help="任務優先級標示為「緊急」時，在派單目標函數中額外獲得的加分，數值越高代表緊急任務越優先被指派。",
+        help= "用於整體排班最佳化。當人力或時段不足、無法完成所有任務時，"
+        "緊急任務會取得較高的派單優先度；不直接改變居服員本身的適配度。",
     )
     continuity_bonus = st.slider(
-        "照護連續性加分（分）", 0.0, 100.0, defaults.preferred_caregiver_bonus, 1.0,
+        "照護連續性加分（歷史首選居服員）", 0.0, 100.0, defaults.preferred_caregiver_bonus, 1.0,
         key="cfg_continuity_bonus",
-        help="當案家的歷史首選居服員恰為候選居服員時的加分，鼓勵維持既有照護關係與默契。"
-        "表現優良（滿意度達門檻）的首選居服員另有動態加成，避免因車程等微幅優化而被替換。",
+        help="若候選居服員等於案家的「歷史首選居服員ID」，即獲得此加分。"
+        "目前預設為 +60 分；若該居服員歷史滿意度 ≥ 4.3，系統另再加 +15 分。",
     )
     skill_bonus = st.slider(
         "核心專長匹配加分（分）", 0.0, 50.0, defaults.cert_bonus_dementia, 1.0,
         key="cfg_skill_bonus",
         help="居服員持有之核心專長證照符合案家特殊照護需求時的加分。",
     )
+
+    st.divider()
+    st.subheader("💰 財務試算設定")
+
     salary_rate_pct = st.slider(
         "居服員拆帳比例（%）", 0, 100, int(defaults.caregiver_salary_rate_per_point * 100), 5,
         key="cfg_salary_rate_pct",
-        help="居服員實領薪資佔該任務長照申報點數（機構營收）的比例，用於試算「預估居服員拆帳薪資」。",
+        help="僅用於估算居服員拆帳薪資，不作為居服員適配度的加減分依據。"
+        "正式導入時可依各機構實際薪資與拆帳制度設定。",
     )
 
 config = PipelineConfig(
     buffer_mins=buffer_mins,
     travel_penalty_weight=travel_penalty_weight,
-    objective_travel_weight=travel_penalty_weight,
     urgent_priority_bonus=urgent_priority_bonus,
     preferred_caregiver_bonus=continuity_bonus,
     cert_bonus_dementia=skill_bonus,
@@ -230,6 +244,9 @@ if st.session_state.get("_data_source_key") != source_key:
     st.session_state["edit_cl"] = sheets["Client_Profiles"].copy()
     st.session_state["edit_tasks"] = sheets["Tasks"].copy()
     st.session_state["data_hist"] = sheets["Historical_Service_Logs"].copy()
+    st.session_state["edit_service_code"] = (
+    sheets["Service_Code"].copy()
+    )
     st.session_state["tasks_sheet_name"] = tasks_sheet_name
 
 # ==========================================
@@ -301,10 +318,11 @@ def render_editable_sheet(session_key: str):
     st.session_state[session_key] = edited
 
 
-tab_cg, tab_cl, tab_tasks = st.tabs([
+tab_cg, tab_cl, tab_tasks, tab_service_code = st.tabs([
     "居服員資料 (Caregiver_Profiles)",
     "案家資料 (Client_Profiles)",
     f"任務資料 ({st.session_state['tasks_sheet_name']})",
+     "服務碼主檔 (Service_Code)",
 ])
 
 with tab_cg:
@@ -319,6 +337,12 @@ with tab_tasks:
     st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
     render_editable_sheet("edit_tasks")
 
+with tab_service_code:
+    st.caption(
+        "修改「CareFlow排班分鐘(暫定)」後，"
+        "下一次執行派單即會重新計算全部任務的服務歷時。"
+    )
+    render_editable_sheet("edit_service_code")
 # ==========================================
 # 區塊③：一鍵執行與成果儀表板
 # ==========================================
@@ -349,11 +373,48 @@ if st.button("🚀 執行 AI 最佳化派單", type="primary"):
     df_hist = st.session_state["data_hist"].copy()
 
     df_tasks = st.session_state["edit_tasks"].copy()
+    df_service_code = (
+    st.session_state["edit_service_code"].copy()
+    )
+
     if has_date_column and schedule_mode == "單日排程" and selected_schedule_date is not None:
         df_tasks = df_tasks[df_tasks["日期"] == selected_schedule_date].copy()
 
     try:
-        tasks = df_tasks.merge(df_cl, on="案家ID", how="left")
+        # 先依Service Code Master重算服務歷時
+        df_tasks = apply_service_duration(
+            df_tasks,
+            df_service_code,
+        )
+        # 暫時用來測試
+        st.dataframe(
+            df_tasks[
+                [
+                    "任務ID",
+                    "案家ID",
+                    "Service_Code_1",
+                    "Units_1",
+                    "原服務歷時(分鐘)",
+                    "服務歷時(分鐘)",
+                    "服務歷時計算明細",
+                ]
+            ],
+            width="stretch",
+        )
+        
+        # 再合併案家資料並進入派單
+        tasks = df_tasks.merge(
+            df_cl,
+            on="案家ID",
+            how="left",
+        )
+
+        df_matches = run_phase1_matching(
+            tasks,
+            df_cg,
+            config,
+        )
+
         df_matches = run_phase1_matching(tasks, df_cg, config)
 
         if has_date_column and schedule_mode == "全月一鍵排程":
@@ -642,15 +703,16 @@ if "last_result" in st.session_state:
             reasons.append("歷史服務滿意度達設定門檻")
 
         if selected_row.get("交通扣分", 0) <= 10:
-            reasons.append("交通成本相對較低")
+            reasons.append("預估轉場車程較短")
 
-        if selected_row.get("疲勞扣分", 0) <= 5:
+        if selected_row.get("工作負荷扣分", 0) <= 5:
             reasons.append("目前工作負荷相對可接受")
-
+            
         if reasons:
             st.markdown("**主要推薦理由**")
             for reason in reasons:
                 st.write(f"✓ {reason}")
+
         # ------------------------------
         # 分數明細
         # ------------------------------
@@ -672,7 +734,7 @@ if "last_result" in st.session_state:
                     float(selected_row.get("連續性品質加分", 0)),
                     float(selected_row.get("滿意度調整", 0)),
                     -float(selected_row.get("交通扣分", 0)),
-                    -float(selected_row.get("疲勞扣分", 0)),
+                    -float(selected_row.get("工作負荷扣分", 0)),
                 ],
             }
         )
