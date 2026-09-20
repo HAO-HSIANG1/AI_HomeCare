@@ -32,6 +32,7 @@ from calendar_view import apply_overrides_to_result, render_calendar_overview, r
 from caregiver_engine import (
     DEFAULT_EXCEL_PATH,
     PipelineConfig,
+    apply_service_duration,
     check_reassignment_conflict,
     get_weekday_name,
     load_override_log,
@@ -85,7 +86,7 @@ ORANGE = "#eb6834"
 MUTED = "#898781"
 GOOD = "#0ca30c"
 
-FIXED_REQUIRED_SHEETS = ["Caregiver_Profiles", "Client_Profiles", "Historical_Service_Logs"]
+FIXED_REQUIRED_SHEETS = ["Caregiver_Profiles", "Client_Profiles", "Historical_Service_Logs","Service_Code"]
 
 # 任務工作表名稱彈性相容：優先偵測月批次格式，其次退回現行單日格式。
 TASKS_SHEET_CANDIDATES = ["Monthly_Pending_Tasks", "Today_Pending_Tasks"]
@@ -103,10 +104,17 @@ REQUIRED_COLUMNS = {
     "Historical_Service_Logs": [
         "居服員ID", "案家ID", "歷史媒合機制(Treatment)", "不滿意導致提早結案(0/1)", "案家滿意度(1-5)",
     ],
+    "Service_Code": [
+        "系統代碼",
+        "CareFlow排班分鐘(暫定)",
+        "是否納入CareFlow",
+    ],
 }
 # 任務工作表的必要欄位為兩種格式共通的欄位；「今日既定行程」「可排班星期」等
 # 各版本專屬欄位皆為選填——caregiver_engine 已能在欄位缺席時安全跳過對應檢查。
-REQUIRED_TASKS_COLUMNS = ["任務ID", "案家ID", "時間窗_開始", "時間窗_結束", "服務歷時(分鐘)", "任務優先級"]
+REQUIRED_TASKS_COLUMNS = ["任務ID", "案家ID", "時間窗_開始", "時間窗_結束", "任務優先級", "Service_Code_1", "Units_1",]
+#移除："服務歷時(分鐘)"因為它之後由程式計算，不再是工程師必須提供的原始欄位。
+#Service_Code_2、Units_2不用列為必填，因為有些任務只有一個服務碼。
 
 st.set_page_config(page_title="長照居家照顧 AI 派單系統", page_icon="🏠", layout="wide")
 st.title("🏠 長照居家照顧 AI 派單系統")
@@ -236,6 +244,9 @@ if st.session_state.get("_data_source_key") != source_key:
     st.session_state["edit_cl"] = sheets["Client_Profiles"].copy()
     st.session_state["edit_tasks"] = sheets["Tasks"].copy()
     st.session_state["data_hist"] = sheets["Historical_Service_Logs"].copy()
+    st.session_state["edit_service_code"] = (
+    sheets["Service_Code"].copy()
+    )
     st.session_state["tasks_sheet_name"] = tasks_sheet_name
 
 # ==========================================
@@ -307,10 +318,11 @@ def render_editable_sheet(session_key: str):
     st.session_state[session_key] = edited
 
 
-tab_cg, tab_cl, tab_tasks = st.tabs([
+tab_cg, tab_cl, tab_tasks, tab_service_code = st.tabs([
     "居服員資料 (Caregiver_Profiles)",
     "案家資料 (Client_Profiles)",
     f"任務資料 ({st.session_state['tasks_sheet_name']})",
+     "服務碼主檔 (Service_Code)",
 ])
 
 with tab_cg:
@@ -325,6 +337,12 @@ with tab_tasks:
     st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
     render_editable_sheet("edit_tasks")
 
+with tab_service_code:
+    st.caption(
+        "修改「CareFlow排班分鐘(暫定)」後，"
+        "下一次執行派單即會重新計算全部任務的服務歷時。"
+    )
+    render_editable_sheet("edit_service_code")
 # ==========================================
 # 區塊③：一鍵執行與成果儀表板
 # ==========================================
@@ -355,11 +373,48 @@ if st.button("🚀 執行 AI 最佳化派單", type="primary"):
     df_hist = st.session_state["data_hist"].copy()
 
     df_tasks = st.session_state["edit_tasks"].copy()
+    df_service_code = (
+    st.session_state["edit_service_code"].copy()
+    )
+
     if has_date_column and schedule_mode == "單日排程" and selected_schedule_date is not None:
         df_tasks = df_tasks[df_tasks["日期"] == selected_schedule_date].copy()
 
     try:
-        tasks = df_tasks.merge(df_cl, on="案家ID", how="left")
+        # 先依Service Code Master重算服務歷時
+        df_tasks = apply_service_duration(
+            df_tasks,
+            df_service_code,
+        )
+        # 暫時用來測試
+        st.dataframe(
+            df_tasks[
+                [
+                    "任務ID",
+                    "案家ID",
+                    "Service_Code_1",
+                    "Units_1",
+                    "原服務歷時(分鐘)",
+                    "服務歷時(分鐘)",
+                    "服務歷時計算明細",
+                ]
+            ],
+            width="stretch",
+        )
+        
+        # 再合併案家資料並進入派單
+        tasks = df_tasks.merge(
+            df_cl,
+            on="案家ID",
+            how="left",
+        )
+
+        df_matches = run_phase1_matching(
+            tasks,
+            df_cg,
+            config,
+        )
+
         df_matches = run_phase1_matching(tasks, df_cg, config)
 
         if has_date_column and schedule_mode == "全月一鍵排程":
