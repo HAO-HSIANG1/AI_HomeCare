@@ -169,7 +169,137 @@ def _get_task_field(row, base_col_name: str):
             return value
     return None
 
+def apply_service_duration(
+    tasks_df: pd.DataFrame,
+    service_code_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """依 Service_Code Master 的分鐘數，重算每筆任務服務歷時。"""
 
+    result = tasks_df.copy()
+
+    required_columns = [
+        "系統代碼",
+        "CareFlow排班分鐘(暫定)",
+        "是否納入CareFlow",
+    ]
+    missing_columns = [
+        column
+        for column in required_columns
+        if column not in service_code_df.columns
+    ]
+
+    if missing_columns:
+        raise ValueError(
+            "Service_Code 缺少必要欄位："
+            + "、".join(missing_columns)
+        )
+
+    master = service_code_df.copy()
+    master = master.dropna(subset=["系統代碼"])
+    master["系統代碼"] = (
+        master["系統代碼"].astype(str).str.strip()
+    )
+
+    duplicated_codes = master[
+        master["系統代碼"].duplicated(keep=False)
+    ]["系統代碼"].unique()
+
+    if len(duplicated_codes) > 0:
+        raise ValueError(
+            "Service_Code Master 有重複代碼："
+            + "、".join(duplicated_codes)
+        )
+
+    master = master.set_index("系統代碼")
+
+    calculated_minutes = []
+    calculation_details = []
+
+    for _, row in result.iterrows():
+        task_id = row.get("任務ID", "未知任務")
+        total_minutes = 0.0
+        details = []
+
+        for index in (1, 2):
+            code_raw = row.get(f"Service_Code_{index}")
+            units_raw = row.get(f"Units_{index}")
+
+            if pd.isna(code_raw) or str(code_raw).strip() == "":
+                continue
+
+            code = str(code_raw).strip()
+
+            if pd.isna(units_raw):
+                raise ValueError(
+                    f"任務 {task_id} 的 {code} 未填寫 Units"
+                )
+
+            try:
+                units = float(units_raw)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    f"任務 {task_id} 的 {code} Units 不是有效數字"
+                )
+
+            if units < 0:
+                raise ValueError(
+                    f"任務 {task_id} 的 {code} Units 不可小於 0"
+                )
+
+            if units == 0:
+                continue
+
+            if code not in master.index:
+                raise ValueError(
+                    f"任務 {task_id} 的服務碼 {code} "
+                    "不存在於 Service_Code Master"
+                )
+
+            master_row = master.loc[code]
+            status = str(
+                master_row["是否納入CareFlow"]
+            ).strip()
+
+            # AA07～AA11是附加碼，不另增加服務分鐘
+            if code.startswith("AA"):
+                details.append(f"{code}×{units:g}=0")
+                continue
+
+            if status in {"否", "否/另模組"}:
+                raise ValueError(
+                    f"任務 {task_id} 使用目前不支援排班的服務碼 {code}"
+                )
+
+            minutes = master_row["CareFlow排班分鐘(暫定)"]
+
+            if pd.isna(minutes):
+                raise ValueError(
+                    f"Service_Code Master 的 {code} "
+                    "尚未設定CareFlow排班分鐘"
+                )
+
+            subtotal = float(minutes) * units
+            total_minutes += subtotal
+            details.append(
+                f"{code}×{units:g}={subtotal:g}分鐘"
+            )
+
+        if total_minutes <= 0:
+            raise ValueError(
+                f"任務 {task_id} 無法計算出有效服務歷時"
+            )
+
+        calculated_minutes.append(total_minutes)
+        calculation_details.append(" + ".join(details))
+
+    # 保留Excel原有值，方便比較
+    if "服務歷時(分鐘)" in result.columns:
+        result["原服務歷時(分鐘)"] = result["服務歷時(分鐘)"]
+
+    result["服務歷時(分鐘)"] = calculated_minutes
+    result["服務歷時計算明細"] = calculation_details
+
+    return result
 # ==========================================
 # 申報法規防呆：BA 服務代碼併報合規檢核
 # ==========================================
